@@ -11,7 +11,7 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -113,6 +113,8 @@ pub struct Supervisor {
     /// Map of live child pid -> index into `processes`.
     pid_index: HashMap<i32, usize>,
     log: RotatingLogger,
+    /// When `logfile=syslog`, the main log goes here instead of to a file.
+    log_syslog: Option<crate::syslog::Syslog>,
     socket_path: PathBuf,
     listener: UnixListener,
     inet_listener: Option<TcpListener>,
@@ -126,6 +128,9 @@ pub struct Supervisor {
     available_configs: HashMap<String, Vec<crate::config::ProgramConfig>>,
     /// Group configs currently instantiated as live processes.
     active_group_configs: HashMap<String, Vec<crate::config::ProgramConfig>>,
+    /// Shared FastCGI listening sockets, one per fcgi group, kept alive for as
+    /// long as the group is active and handed to each child as fd 0.
+    fcgi_listeners: HashMap<String, OwnedFd>,
 }
 
 impl Supervisor {
@@ -134,12 +139,24 @@ impl Supervisor {
     pub fn new(config: Config) -> Result<Supervisor, String> {
         let _ = std::fs::create_dir_all(&config.supervisord.childlogdir);
 
-        let log = RotatingLogger::new(
-            Some(config.supervisord.logfile.clone()),
-            config.supervisord.logfile_maxbytes,
-            config.supervisord.logfile_backups,
-        )
-        .map_err(|e| format!("cannot open logfile: {e}"))?;
+        // `logfile=syslog` routes the main log to the system log instead of a
+        // file (mirroring the original).
+        let to_syslog = config.supervisord.logfile.as_os_str() == "syslog";
+        let log = if to_syslog {
+            RotatingLogger::null()
+        } else {
+            RotatingLogger::new(
+                Some(config.supervisord.logfile.clone()),
+                config.supervisord.logfile_maxbytes,
+                config.supervisord.logfile_backups,
+            )
+            .map_err(|e| format!("cannot open logfile: {e}"))?
+        };
+        let log_syslog = if to_syslog {
+            Some(crate::syslog::Syslog::new("supervisord"))
+        } else {
+            None
+        };
 
         let socket_path = config
             .socket_path
@@ -175,11 +192,12 @@ impl Supervisor {
         let grouped = group_configs(&config.programs);
         let config_path = config.path.clone();
 
-        Ok(Supervisor {
+        let mut sup = Supervisor {
             config,
             processes,
             pid_index: HashMap::new(),
             log,
+            log_syslog,
             socket_path,
             listener,
             inet_listener,
@@ -188,13 +206,20 @@ impl Supervisor {
             config_path,
             available_configs: grouped.clone(),
             active_group_configs: grouped,
-        })
+            fcgi_listeners: HashMap::new(),
+        };
+        sup.wire_fcgi()?;
+        Ok(sup)
     }
 
     /// Write a timestamped line to the main supervisor log.
     fn log_line(&mut self, level: &str, msg: &str) {
         let line = format!("{} {} {}\n", now_timestamp(), level, msg);
-        self.log.write(line.as_bytes());
+        if let Some(sl) = self.log_syslog.as_mut() {
+            sl.feed(line.as_bytes());
+        } else {
+            self.log.write(line.as_bytes());
+        }
         if !self.config.supervisord.silent && self.config.supervisord.nodaemon {
             print!("{line}");
             let _ = std::io::stdout().flush();
@@ -703,14 +728,19 @@ impl Supervisor {
             .ok_or((rpc::faults::BAD_NAME, name.to_string()))?;
 
         let childlogdir = self.config.supervisord.childlogdir.clone();
+        let start_idx = self.processes.len();
         for cfg in &cfgs {
-            let mut proc = Process::new(cfg.clone(), &childlogdir);
-            if cfg.autostart {
-                proc.start(now);
-            }
-            self.processes.push(proc);
+            self.processes.push(Process::new(cfg.clone(), &childlogdir));
         }
         self.active_group_configs.insert(name.to_string(), cfgs);
+        // Create/assign the shared FastCGI socket BEFORE autostart, so the
+        // first spawn already has its fd 0.
+        self.wire_fcgi().map_err(|e| (rpc::faults::FAILED, e))?;
+        for i in start_idx..self.processes.len() {
+            if self.processes[i].config.autostart {
+                self.processes[i].start(now);
+            }
+        }
         self.resync_pid_index();
         self.log_line("INFO", &format!("added process group '{name}'"));
         Ok(())
@@ -730,6 +760,8 @@ impl Supervisor {
         }
         self.processes.retain(|p| p.config.group != name);
         self.active_group_configs.remove(name);
+        // Close the group's shared FastCGI socket, if it had one.
+        self.fcgi_listeners.remove(name);
         self.resync_pid_index();
         self.log_line("INFO", &format!("removed process group '{name}'"));
         Ok(())
@@ -768,8 +800,64 @@ impl Supervisor {
         Ok(String::from_utf8_lossy(slice).into_owned())
     }
 
+    /// `tailProcess*Log`: return `(data, new_offset, overflow)`, faithfully
+    /// porting the original `options.tailFile` so clients that follow logs see
+    /// the same offset/overflow behaviour.
+    pub fn tail_process_log(
+        &self,
+        name: &str,
+        channel: &str,
+        offset: i64,
+        length: i64,
+    ) -> Result<(String, i64, bool), (i32, String)> {
+        let idx = self
+            .find(name)
+            .ok_or((rpc::faults::BAD_NAME, name.to_string()))?;
+        let path = match channel {
+            "stderr" => self.processes[idx].stderr_path.clone(),
+            _ => self.processes[idx].stdout_path.clone(),
+        };
+        if path.is_empty() || !std::path::Path::new(&path).exists() {
+            // tail is lenient about a missing log.
+            return Ok((String::new(), offset, false));
+        }
+        let data = std::fs::read(&path).map_err(|e| (rpc::faults::FAILED, e.to_string()))?;
+        let sz = data.len() as i64;
+
+        let mut overflow = false;
+        let mut offset = offset;
+        let mut length = length;
+        if sz > offset + length {
+            overflow = true;
+            offset = sz - 1;
+        }
+        if offset + length > sz {
+            if offset > sz - 1 {
+                length = 0;
+            }
+            offset = sz - length;
+        }
+        if offset < 0 {
+            offset = 0;
+        }
+        if length < 0 {
+            length = 0;
+        }
+        let out = if length == 0 {
+            String::new()
+        } else {
+            let start = offset as usize;
+            let end = (start + length as usize).min(data.len());
+            String::from_utf8_lossy(&data[start..end]).into_owned()
+        };
+        Ok((out, sz, overflow))
+    }
+
     /// Read up to `length` bytes of the main supervisord log from `offset`.
     pub fn read_main_log(&self, offset: i64, length: i64) -> Result<String, (i32, String)> {
+        if self.log_syslog.is_some() {
+            return Err((rpc::faults::NO_FILE, "syslog".to_string()));
+        }
         let path = &self.config.supervisord.logfile;
         if !path.exists() {
             return Err((rpc::faults::NO_FILE, path.display().to_string()));
@@ -785,9 +873,12 @@ impl Supervisor {
         Ok(String::from_utf8_lossy(slice).into_owned())
     }
 
-    /// Clear (truncate) the main supervisord log.
+    /// Clear (truncate) the main supervisord log. A no-op when logging to
+    /// syslog (there is no file to truncate).
     pub fn clear_main_log(&mut self) -> Result<(), (i32, String)> {
-        self.log.clear();
+        if self.log_syslog.is_none() {
+            self.log.clear();
+        }
         Ok(())
     }
 
@@ -902,6 +993,42 @@ impl Supervisor {
         let _ = std::fs::remove_file(&self.config.supervisord.pidfile);
     }
 
+    /// Ensure every active FastCGI group has its shared listening socket, then
+    /// hand the raw fd to each of that group's processes (used as their fd 0).
+    fn wire_fcgi(&mut self) -> Result<(), String> {
+        // Determine which fcgi groups still need a socket created.
+        let mut needed: Vec<(String, String, Option<String>, Option<u32>)> = Vec::new();
+        for p in &self.processes {
+            if !p.config.is_fcgi {
+                continue;
+            }
+            let g = p.config.group.clone();
+            if self.fcgi_listeners.contains_key(&g) || needed.iter().any(|(gg, ..)| *gg == g) {
+                continue;
+            }
+            let spec = p
+                .config
+                .fcgi_socket
+                .clone()
+                .ok_or_else(|| format!("fcgi program '{}' has no socket", p.name()))?;
+            needed.push((g, spec, p.config.socket_owner.clone(), p.config.socket_mode));
+        }
+        for (g, spec, owner, mode) in needed {
+            let fd = create_fcgi_socket(&spec, owner.as_deref(), mode)?;
+            self.log_line("INFO", &format!("created fcgi socket for group '{g}' ({spec})"));
+            self.fcgi_listeners.insert(g, fd);
+        }
+        // Point every fcgi process at its group's shared socket.
+        for p in &mut self.processes {
+            if p.config.is_fcgi {
+                if let Some(fd) = self.fcgi_listeners.get(&p.config.group) {
+                    p.set_fcgi_fd(fd.as_raw_fd());
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Re-exec this binary with the original arguments (for `restart`).
     fn exec_self(&mut self) {
         use std::os::unix::process::CommandExt;
@@ -912,6 +1039,71 @@ impl Supervisor {
             let err = std::process::Command::new(exe).args(&args[1..]).exec();
             self.log_line("ERRO", &format!("re-exec failed: {err}"));
         }
+    }
+}
+
+/// Create the shared FastCGI listening socket from a `socket=` spec
+/// (`unix://path` or `tcp://host:port`). The returned fd is close-on-exec
+/// (std default), so only the explicitly-duped fd 0 reaches fcgi children.
+fn create_fcgi_socket(
+    spec: &str,
+    owner: Option<&str>,
+    mode: Option<u32>,
+) -> Result<OwnedFd, String> {
+    if let Some(path) = spec.strip_prefix("unix://") {
+        let _ = std::fs::remove_file(path);
+        let listener =
+            UnixListener::bind(path).map_err(|e| format!("fcgi unix socket {path}: {e}"))?;
+        if let Some(m) = mode {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(m));
+        }
+        if let Some(o) = owner {
+            chown_path(path, o);
+        }
+        Ok(unsafe { OwnedFd::from_raw_fd(listener.into_raw_fd()) })
+    } else if let Some(addr) = spec.strip_prefix("tcp://") {
+        let listener = TcpListener::bind(addr).map_err(|e| format!("fcgi tcp socket {addr}: {e}"))?;
+        Ok(unsafe { OwnedFd::from_raw_fd(listener.into_raw_fd()) })
+    } else {
+        Err(format!(
+            "invalid fcgi socket spec (expected unix:// or tcp://): {spec}"
+        ))
+    }
+}
+
+/// Best-effort chown of a unix socket path to `user[:group]`.
+fn chown_path(path: &str, owner: &str) {
+    let (user, group) = match owner.split_once(':') {
+        Some((u, g)) => (u, Some(g)),
+        None => (owner, None),
+    };
+    let Ok(cpath) = std::ffi::CString::new(path) else {
+        return;
+    };
+    let uid = std::ffi::CString::new(user).ok().and_then(|c| unsafe {
+        let pw = libc::getpwnam(c.as_ptr());
+        if pw.is_null() {
+            None
+        } else {
+            Some((*pw).pw_uid)
+        }
+    });
+    let gid = group.and_then(|g| {
+        std::ffi::CString::new(g).ok().and_then(|c| unsafe {
+            let gr = libc::getgrnam(c.as_ptr());
+            if gr.is_null() {
+                None
+            } else {
+                Some((*gr).gr_gid)
+            }
+        })
+    });
+    // (uid_t)-1 / (gid_t)-1 means "don't change".
+    let uid = uid.unwrap_or(u32::MAX);
+    let gid = gid.unwrap_or(u32::MAX);
+    unsafe {
+        libc::chown(cpath.as_ptr(), uid, gid);
     }
 }
 
@@ -1153,6 +1345,87 @@ mod tests {
         assert!(added.is_empty(), "unexpected added: {added:?}");
         assert!(changed.is_empty(), "unexpected changed: {changed:?}");
         assert!(removed.is_empty(), "unexpected removed: {removed:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tail_log_overflow_semantics() {
+        let dir = temp_dir("tail");
+        let sup = build(&dir, "[program:p]\ncommand=/bin/true\nautostart=false\n");
+        // The AUTO stdout log resolves under childlogdir; write 100 known bytes.
+        let logpath = sup.process_info("p").unwrap().stdout_logfile;
+        let body: Vec<u8> = (0..100u8).collect();
+        std::fs::write(&logpath, &body).unwrap();
+
+        // Reading from the start with a small window overflows to the tail.
+        let (data, off, overflow) = sup.tail_process_log("p", "stdout", 0, 10).unwrap();
+        assert!(overflow);
+        assert_eq!(off, 100);
+        assert_eq!(data.len(), 10);
+        assert_eq!(data.as_bytes(), &body[90..100]);
+
+        // A window larger than the file returns everything, no overflow.
+        let (data, off, overflow) = sup.tail_process_log("p", "stdout", 0, 1000).unwrap();
+        assert!(!overflow);
+        assert_eq!(off, 100);
+        assert_eq!(data.len(), 100);
+
+        // Caught up at EOF returns nothing.
+        let (data, off, overflow) = sup.tail_process_log("p", "stdout", 100, 10).unwrap();
+        assert!(!overflow);
+        assert_eq!(off, 100);
+        assert!(data.is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn group_wildcard_routes_to_the_whole_group() {
+        let dir = temp_dir("wildcard");
+        let mut sup = build(
+            &dir,
+            "[program:a]\ncommand=/bin/true\nautostart=false\n\
+             [program:b]\ncommand=/bin/true\nautostart=false\n\
+             [group:grp]\nprograms=a,b\n",
+        );
+        // stopProcess("grp:*") targets every member -> array of results.
+        let res = call(&mut sup, "supervisor.stopProcess", &[Value::Str("grp:*".into())]).unwrap();
+        match res {
+            Value::Array(items) => {
+                assert_eq!(items.len(), 2);
+                // Both are stopped already -> NOT_RUNNING status in each result.
+                for it in &items {
+                    assert_eq!(field(it, "status"), Some(&Value::Int(rpc::faults::NOT_RUNNING as i64)));
+                }
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+        // An unknown group -> BAD_NAME.
+        let err = call(&mut sup, "supervisor.stopProcess", &[Value::Str("nope:*".into())]);
+        assert_eq!(err.unwrap_err().0, rpc::faults::BAD_NAME);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn logfile_syslog_uses_no_file() {
+        let dir = temp_dir("syslog");
+        // logfile=syslog routes the main log away from a file.
+        let cfg = Config::parse(&format!(
+            "[unix_http_server]\nfile={d}/s.sock\n[supervisord]\nlogfile=syslog\nchildlogdir={d}\npidfile={d}/sd.pid\n",
+            d = dir.display()
+        ))
+        .unwrap();
+        let mut sup = Supervisor::new(cfg).unwrap();
+        sup.log_line("INFO", "this should go to syslog, not a file");
+
+        // No `syslog` file was created in the working dir, and reading the main
+        // log reports there is no file.
+        assert!(!std::path::Path::new("syslog").exists());
+        assert_eq!(sup.read_main_log(0, 0).unwrap_err().0, rpc::faults::NO_FILE);
+        // Clearing is a harmless no-op.
+        assert!(sup.clear_main_log().is_ok());
 
         let _ = std::fs::remove_dir_all(&dir);
     }

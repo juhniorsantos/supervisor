@@ -67,11 +67,24 @@ pub fn dispatch(
 
         "startProcess" => {
             let name = str_param(params, 0)?;
+            // `group:*` targets the whole group (returns an array of results).
+            if let Some(group) = group_spec(&name) {
+                if !sup.has_group(&group) {
+                    return Err((faults::BAD_NAME, name));
+                }
+                return Ok(results_array(&sup.op_start_group(&group, now)));
+            }
             sup.op_start(&name, now)?;
             Ok(Value::Bool(true))
         }
         "stopProcess" => {
             let name = str_param(params, 0)?;
+            if let Some(group) = group_spec(&name) {
+                if !sup.has_group(&group) {
+                    return Err((faults::BAD_NAME, name));
+                }
+                return Ok(results_array(&sup.op_stop_group(&group, now)));
+            }
             sup.op_stop(&name, now)?;
             Ok(Value::Bool(true))
         }
@@ -125,6 +138,12 @@ pub fn dispatch(
         "signalProcess" => {
             let name = str_param(params, 0)?;
             let sig = signal_param(params, 1)?;
+            if let Some(group) = group_spec(&name) {
+                if !sup.has_group(&group) {
+                    return Err((faults::BAD_NAME, name));
+                }
+                return Ok(results_array(&sup.op_signal_group(&group, sig)));
+            }
             sup.op_signal(&name, sig)?;
             Ok(Value::Bool(true))
         }
@@ -209,9 +228,8 @@ fn read_log(
     Ok(Value::Str(text))
 }
 
-/// `tailProcess*Log` returns `[bytes, offset, overflow]`. We read the tail of
-/// the file and report the new offset; overflow is reported when the file is
-/// larger than `length`.
+/// `tailProcess*Log` returns `[bytes, new_offset, overflow]` with the
+/// original's offset/overflow semantics.
 fn tail_log(
     sup: &Supervisor,
     params: &[Value],
@@ -220,14 +238,21 @@ fn tail_log(
     let name = str_param(params, 0)?;
     let offset = int_param(params, 1).unwrap_or(0);
     let length = int_param(params, 2).unwrap_or(0);
-    // tail is lenient when the log is missing.
-    let text = sup.read_log(&name, channel, offset, length).unwrap_or_default();
-    let new_offset = offset + text.len() as i64;
+    let (text, new_offset, overflow) = sup.tail_process_log(&name, channel, offset, length)?;
     Ok(Value::Array(vec![
         Value::Str(text),
         Value::Int(new_offset),
-        Value::Bool(false),
+        Value::Bool(overflow),
     ]))
+}
+
+/// If `name` is a whole-group spec (`group:*` or `group:`), return the group
+/// name; otherwise `None` (it targets a single process).
+fn group_spec(name: &str) -> Option<String> {
+    match name.split_once(':') {
+        Some((g, p)) if p.is_empty() || p == "*" => Some(g.to_string()),
+        _ => None,
+    }
 }
 
 fn info_to_value(info: &ProcessInfo) -> Value {

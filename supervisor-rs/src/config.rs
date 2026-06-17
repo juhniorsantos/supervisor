@@ -87,6 +87,15 @@ pub struct ProgramConfig {
     pub events: Vec<String>,
     /// Listener event buffer size.
     pub buffer_size: usize,
+    /// True for `[fcgi-program:x]` sections: the group shares one listening
+    /// socket which is passed to each child as fd 0 (the FastCGI convention).
+    pub is_fcgi: bool,
+    /// The `socket=` value (`unix://path` or `tcp://host:port`).
+    pub fcgi_socket: Option<String>,
+    /// `socket_owner` (`user` or `user:group`) for a unix FastCGI socket.
+    pub socket_owner: Option<String>,
+    /// `socket_mode` (octal) for a unix FastCGI socket.
+    pub socket_mode: Option<u32>,
 }
 
 /// Configuration for the `[supervisord]` section.
@@ -448,10 +457,13 @@ impl Config {
                     password: m.get("password").map(|s| s.to_string()),
                 };
             } else if let Some(prog) = sec.name.strip_prefix("program:") {
-                let expanded = parse_program(prog.trim(), &sec.items, &supervisord, false)?;
+                let expanded = parse_program(prog.trim(), &sec.items, &supervisord, ProgKind::Program)?;
                 programs.extend(expanded);
             } else if let Some(listener) = sec.name.strip_prefix("eventlistener:") {
-                let expanded = parse_program(listener.trim(), &sec.items, &supervisord, true)?;
+                let expanded = parse_program(listener.trim(), &sec.items, &supervisord, ProgKind::Listener)?;
+                programs.extend(expanded);
+            } else if let Some(fcgi) = sec.name.strip_prefix("fcgi-program:") {
+                let expanded = parse_program(fcgi.trim(), &sec.items, &supervisord, ProgKind::Fcgi)?;
                 programs.extend(expanded);
             }
             // Other sections (rpcinterface, supervisorctl) are accepted but
@@ -633,19 +645,51 @@ fn parse_supervisord(items: &[(String, String)]) -> Result<SupervisordConfig, St
     Ok(c)
 }
 
+/// Which kind of `[...:x]` section a set of program options came from.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProgKind {
+    Program,
+    Listener,
+    Fcgi,
+}
+
 fn parse_program(
     name: &str,
     items: &[(String, String)],
     supervisord: &SupervisordConfig,
-    is_listener: bool,
+    kind: ProgKind,
 ) -> Result<Vec<ProgramConfig>, String> {
     let m = items_map(items);
 
-    let kind = if is_listener { "eventlistener" } else { "program" };
+    let is_listener = kind == ProgKind::Listener;
+    let is_fcgi = kind == ProgKind::Fcgi;
+    let kind_label = match kind {
+        ProgKind::Program => "program",
+        ProgKind::Listener => "eventlistener",
+        ProgKind::Fcgi => "fcgi-program",
+    };
     let command = m
         .get("command")
-        .ok_or_else(|| format!("[{kind}:{name}] is missing required 'command'"))?
+        .ok_or_else(|| format!("[{kind_label}:{name}] is missing required 'command'"))?
         .to_string();
+
+    // FastCGI programs share one listening socket across the group.
+    let fcgi_socket = if is_fcgi {
+        let raw = m
+            .get("socket")
+            .ok_or_else(|| format!("[fcgi-program:{name}] is missing required 'socket'"))?;
+        Some(raw.replace("%(program_name)s", name))
+    } else {
+        None
+    };
+    let socket_owner = m.get("socket_owner").map(|s| s.to_string());
+    let socket_mode = match m.get("socket_mode") {
+        None => None,
+        Some(v) => Some(
+            u32::from_str_radix(v.trim_start_matches("0o").trim(), 8)
+                .map_err(|_| "invalid socket_mode")?,
+        ),
+    };
 
     let numprocs: usize = m
         .get("numprocs")
@@ -775,6 +819,10 @@ fn parse_program(
             is_listener,
             events: events.clone(),
             buffer_size,
+            is_fcgi,
+            fcgi_socket: fcgi_socket.clone(),
+            socket_owner: socket_owner.clone(),
+            socket_mode,
         });
     }
     Ok(out)
@@ -882,6 +930,32 @@ buffer_size=20
         assert_eq!(l.buffer_size, 20);
         assert_eq!(l.events, vec!["PROCESS_STATE".to_string(), "TICK_60".to_string()]);
         assert_eq!(l.priority, -1); // listeners start first by default
+    }
+
+    #[test]
+    fn fcgi_program_section_is_parsed() {
+        let text = "\
+[fcgi-program:app]
+command=/usr/bin/app
+socket=unix:///tmp/app.sock
+socket_mode=0700
+numprocs=2
+process_name=%(program_name)s_%(process_num)02d
+";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.programs.len(), 2);
+        let p = &cfg.programs[0];
+        assert!(p.is_fcgi);
+        assert_eq!(p.fcgi_socket.as_deref(), Some("unix:///tmp/app.sock"));
+        assert_eq!(p.socket_mode, Some(0o700));
+        assert_eq!(p.group, "app");
+        assert_eq!(cfg.programs[1].name, "app_01");
+    }
+
+    #[test]
+    fn fcgi_program_requires_a_socket() {
+        let err = Config::parse("[fcgi-program:app]\ncommand=/usr/bin/app\n").unwrap_err();
+        assert!(err.contains("socket"), "got: {err}");
     }
 
     #[test]

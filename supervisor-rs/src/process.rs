@@ -13,7 +13,7 @@
 //!   `stopwaitsecs`.
 
 use std::ffi::CString;
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -88,6 +88,9 @@ pub struct Process {
     /// slow-to-drain write resume across ticks without re-sending.
     pending_write: Vec<u8>,
     pending_off: usize,
+    /// For FastCGI programs: the shared listening socket (owned by the
+    /// supervisor) that becomes the child's fd 0. Borrowed, not owned.
+    fcgi_listen_fd: Option<RawFd>,
 }
 
 /// The state of an event listener in the notification protocol, mirroring
@@ -184,11 +187,18 @@ impl Process {
             event_buffer: std::collections::VecDeque::new(),
             pending_write: Vec::new(),
             pending_off: 0,
+            fcgi_listen_fd: None,
         }
     }
 
     pub fn is_listener(&self) -> bool {
         self.config.is_listener
+    }
+
+    /// Point this FastCGI process at the group's shared listening socket; it
+    /// will be handed to the child as fd 0 on each spawn.
+    pub fn set_fcgi_fd(&mut self, fd: RawFd) {
+        self.fcgi_listen_fd = Some(fd);
     }
 
     /// The pool (group) name used in event envelopes.
@@ -341,20 +351,33 @@ impl Process {
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
 
-        // Every process gets a stdin pipe we keep the write end of: event
+        // FastCGI programs get the group's shared listening socket as fd 0;
+        // everything else gets a stdin pipe we keep the write end of (event
         // listeners receive event envelopes there, ordinary programs receive
-        // `sendProcessStdin` data. The child's read end stays blocking; our
+        // `sendProcessStdin` data). The child's read end stays blocking; our
         // write end is non-blocking so we never stall the event loop.
-        let (stdin_read, stdin_write) = match make_stdin_pipe() {
-            Ok(pair) => pair,
-            Err(e) => {
-                self.spawnerr = Some(format!("pipe failed: {e}"));
+        let stdin_write = if let Some(raw) = self.fcgi_listen_fd {
+            let dup = unsafe { libc::dup(raw) };
+            if dup < 0 {
+                self.spawnerr = Some("dup of fcgi socket failed".to_string());
                 self.fail_to_backoff(now);
                 return;
             }
+            cmd.stdin(Stdio::from(unsafe { OwnedFd::from_raw_fd(dup) }));
+            None
+        } else {
+            match make_stdin_pipe() {
+                Ok((stdin_read, w)) => {
+                    cmd.stdin(Stdio::from(stdin_read));
+                    Some(w)
+                }
+                Err(e) => {
+                    self.spawnerr = Some(format!("pipe failed: {e}"));
+                    self.fail_to_backoff(now);
+                    return;
+                }
+            }
         };
-        cmd.stdin(Stdio::from(stdin_read));
-        let stdin_write = Some(stdin_write);
 
         let mut err_read: Option<OwnedFd> = None;
         if self.config.redirect_stderr {

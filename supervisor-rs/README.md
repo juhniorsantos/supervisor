@@ -99,7 +99,7 @@ Implemented RPC methods: `getAPIVersion`/`getVersion`,
 
 ## Supported configuration
 
-`[supervisord]`: `logfile`, `logfile_maxbytes`, `logfile_backups`,
+`[supervisord]`: `logfile` (a path, or `syslog`), `logfile_maxbytes`, `logfile_backups`,
 `loglevel`, `pidfile`, `nodaemon`, `silent`, `childlogdir`, `directory`,
 `identifier`, `umask`, `environment`.
 
@@ -113,6 +113,10 @@ Implemented RPC methods: `getAPIVersion`/`getVersion`,
 
 `[eventlistener:x]`: like `[program:x]`, plus `events` (subscribed event
 types) and `buffer_size`.
+
+`[fcgi-program:x]`: like `[program:x]`, plus `socket` (`unix://path` or
+`tcp://host:port`), `socket_owner`, `socket_mode`; the group shares one
+listening socket passed to each child as fd 0.
 
 `[include]`: `files` (whitespace-separated paths/globs, relative to the main
 config's directory).
@@ -168,13 +172,18 @@ Implemented (the MVP you asked for):
 - [x] **Log capture mode**: `stdout/stderr_capture_maxbytes` →
       `PROCESS_COMMUNICATION_*` events
 - [x] **Syslog output**: `stdout_syslog`/`stderr_syslog` forward lines to
-      `/dev/log`
+      `/dev/log`, plus `logfile=syslog` for the main log
+- [x] **FastCGI** (`[fcgi-program:x]`): one shared listening socket
+      (`unix://`/`tcp://`, `socket_owner`/`socket_mode`) handed to every child
+      as fd 0
+- [x] **Group wildcards** (`group:*`) for `start`/`stop`/`signalProcess`, and
+      faithful `tailProcess*Log` offset/overflow semantics
 
-Not yet ported (smaller remaining bits):
+Not yet ported (smaller remaining options):
 
-- [ ] `fcgi-program:x` sections
-- [ ] A few niche RPC methods (`getProcessInfo` for `group:*` wildcards,
-      `tail` overflow semantics) and `loglevel`-to-syslog for the main log
+- [ ] `stopasgroup`/`killasgroup` (this build always signals the child's
+      process group), `numprocs_start`, per-program `serverurl`
+- [ ] `%(here)s`/`%(ENV_x)s` expansions in arbitrary option values
 
 ## Tests
 
