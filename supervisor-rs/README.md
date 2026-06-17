@@ -100,7 +100,8 @@ Implemented RPC methods: `getAPIVersion`/`getVersion`,
 ## Supported configuration
 
 `[supervisord]`: `logfile` (a path, or `syslog`), `logfile_maxbytes`, `logfile_backups`,
-`loglevel`, `pidfile`, `nodaemon`, `silent`, `childlogdir`, `directory`,
+`loglevel` (`critical`/`error`/`warn`/`info`/`debug`/`trace`/`blather`, filters
+the main log), `pidfile`, `nodaemon`, `silent`, `childlogdir`, `directory`,
 `identifier`, `umask`, `environment`.
 
 `[unix_http_server]`: `file` (the control socket path), `username`,
@@ -184,7 +185,7 @@ Implemented (the MVP you asked for):
 Not yet ported (smaller remaining options):
 
 - [ ] `numprocs_start`, per-program `serverurl`, `*_events_enabled`
-- [ ] `loglevel` filtering, `minfds`/`minprocs`, supervisord `user`/`nocleanup`
+- [ ] `minfds`/`minprocs`, supervisord `user`/`nocleanup`/`strip_ansi`
 - [ ] `%(here)s`/`%(ENV_x)s` expansions in arbitrary option values
 - [ ] `getAllConfigInfo` / `system.*` RPC, `[rpcinterface:x]` plugins
 

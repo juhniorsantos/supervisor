@@ -115,6 +115,9 @@ pub struct Supervisor {
     log: RotatingLogger,
     /// When `logfile=syslog`, the main log goes here instead of to a file.
     log_syslog: Option<crate::syslog::Syslog>,
+    /// Numeric `loglevel` threshold; a message is written only if its own
+    /// level is at least this value (CRIT=50 … BLAT=3).
+    loglevel_threshold: i32,
     socket_path: PathBuf,
     listener: UnixListener,
     inet_listener: Option<TcpListener>,
@@ -191,6 +194,7 @@ impl Supervisor {
 
         let grouped = group_configs(&config.programs);
         let config_path = config.path.clone();
+        let config_loglevel = config.supervisord.loglevel.clone();
 
         let mut sup = Supervisor {
             config,
@@ -198,6 +202,7 @@ impl Supervisor {
             pid_index: HashMap::new(),
             log,
             log_syslog,
+            loglevel_threshold: level_value(&config_loglevel),
             socket_path,
             listener,
             inet_listener,
@@ -214,6 +219,10 @@ impl Supervisor {
 
     /// Write a timestamped line to the main supervisor log.
     fn log_line(&mut self, level: &str, msg: &str) {
+        // Drop messages below the configured loglevel threshold.
+        if level_value(level) < self.loglevel_threshold {
+            return;
+        }
         let line = format!("{} {} {}\n", now_timestamp(), level, msg);
         if let Some(sl) = self.log_syslog.as_mut() {
             sl.feed(line.as_bytes());
@@ -402,6 +411,7 @@ impl Supervisor {
     /// event to each ready listener.
     fn dispatch_to_listeners(&mut self) {
         let identifier = self.config.supervisord.identifier.clone();
+        let mut dispatched: Vec<(u64, String, String)> = Vec::new();
         for p in &mut self.processes {
             if !p.is_listener() {
                 continue;
@@ -424,7 +434,13 @@ impl Supervisor {
                     len = payload.len(),
                 );
                 p.begin_send_event(envelope.into_bytes());
+                dispatched.push((serial, p.pool_name().to_string(), name));
             }
+        }
+        // Logged at DEBG so `loglevel=debug` shows event flow without spamming
+        // the default info log.
+        for (serial, pool, name) in dispatched {
+            self.log_line("DEBG", &format!("event {serial} ({name}) sent to listener {pool}"));
         }
     }
 
@@ -1130,6 +1146,22 @@ fn fault_message(code: i32) -> String {
     }
 }
 
+/// Map a level name (config long form like `info`/`debug`, or the short tag
+/// used in log lines like `INFO`/`DEBG`) to its numeric value. Higher is more
+/// important; unknown names fall back to `info`. Mirrors `LevelsByName`.
+fn level_value(name: &str) -> i32 {
+    match name.to_ascii_lowercase().as_str() {
+        "critical" | "crit" => 50,
+        "error" | "erro" => 40,
+        "warn" | "warning" => 30,
+        "info" => 20,
+        "debug" | "debg" => 10,
+        "trace" | "trac" => 5,
+        "blather" | "blat" => 3,
+        _ => 20,
+    }
+}
+
 /// A short, syslog-ish timestamp for log lines.
 fn now_timestamp() -> String {
     let now = unsafe { libc::time(std::ptr::null_mut()) };
@@ -1426,6 +1458,43 @@ mod tests {
         assert_eq!(sup.read_main_log(0, 0).unwrap_err().0, rpc::faults::NO_FILE);
         // Clearing is a harmless no-op.
         assert!(sup.clear_main_log().is_ok());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn level_value_ordering() {
+        assert!(level_value("CRIT") > level_value("ERRO"));
+        assert!(level_value("ERRO") > level_value("WARN"));
+        assert!(level_value("WARN") > level_value("INFO"));
+        assert!(level_value("INFO") > level_value("DEBG"));
+        assert!(level_value("DEBG") > level_value("TRAC"));
+        // Long config names and short tags agree; unknown -> info.
+        assert_eq!(level_value("debug"), level_value("DEBG"));
+        assert_eq!(level_value("warning"), level_value("WARN"));
+        assert_eq!(level_value("bogus"), level_value("info"));
+    }
+
+    #[test]
+    fn loglevel_filters_lower_severity_messages() {
+        let dir = temp_dir("loglevel");
+        let cfg = Config::parse(&format!(
+            "[unix_http_server]\nfile={d}/s.sock\n[supervisord]\nlogfile={d}/sd.log\n\
+             childlogdir={d}\npidfile={d}/sd.pid\nloglevel=warn\n",
+            d = dir.display()
+        ))
+        .unwrap();
+        let mut sup = Supervisor::new(cfg).unwrap();
+        sup.log_line("DEBG", "debug-hidden");
+        sup.log_line("INFO", "info-hidden");
+        sup.log_line("WARN", "warn-shown");
+        sup.log_line("ERRO", "erro-shown");
+
+        let logged = std::fs::read_to_string(dir.join("sd.log")).unwrap();
+        assert!(!logged.contains("debug-hidden"));
+        assert!(!logged.contains("info-hidden"));
+        assert!(logged.contains("warn-shown"));
+        assert!(logged.contains("erro-shown"));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
