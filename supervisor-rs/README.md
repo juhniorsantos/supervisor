@@ -62,6 +62,7 @@ The crate is split into focused modules (`src/`):
 | `rpc.rs`      | The `supervisor.*` XML-RPC method set (API 3.0). |
 | `events.rs`   | Event names, payloads and listener-subscription matching. |
 | `syslog.rs`   | Minimal line-buffered syslog client (`/dev/log`). |
+| `util.rs`     | Small shared helpers (e.g. subslice search). |
 | `web.rs`      | The web management UI served at `GET /`. |
 | `control.rs`  | XML-RPC-over-HTTP client used by `supervisorctl`. |
 | `bin/supervisord.rs`   | Daemon entry point (arg parsing, daemonize, pidfile). |

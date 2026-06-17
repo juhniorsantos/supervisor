@@ -1,20 +1,27 @@
 //! A minimal web management UI served at `GET /`.
 //!
-//! It renders a status table and exposes start/stop/restart actions as
-//! links (`/?action=start&name=web`). It is intentionally dependency-free:
-//! a single self-contained HTML page with inline CSS.
+//! It renders a status table and exposes start/stop/restart actions as small
+//! form `POST`s (so a `GET`/refresh/prefetch never changes state). It is
+//! intentionally dependency-free: a single self-contained HTML page with
+//! inline CSS.
 
 use std::time::Instant;
 
 use crate::daemon::Supervisor;
 use crate::states::ProcessState;
 
-/// Render the status page, first applying any action encoded in the query
-/// string (`action=start|stop|restart|startall|stopall|restartall`,
-/// `name=<process>`).
-pub fn render(sup: &mut Supervisor, query: &str, now: Instant) -> String {
+/// Parse an `application/x-www-form-urlencoded` body (or URL query string)
+/// into key/value pairs.
+pub fn parse_form(body: &str) -> Vec<(String, String)> {
+    parse_query(body)
+}
+
+/// Render the status page. Any action is taken from `params`
+/// (`action=start|stop|restart|startall|stopall|restartall`, `name=<process>`)
+/// — these come only from POST submissions, never from a GET, so the page is
+/// safe to prefetch/refresh.
+pub fn render(sup: &mut Supervisor, params: &[(String, String)], now: Instant) -> String {
     let mut notice = String::new();
-    let params = parse_query(query);
     if let Some(action) = params.iter().find(|(k, _)| k == "action").map(|(_, v)| v.clone()) {
         let name = params
             .iter()
@@ -39,17 +46,15 @@ pub fn render(sup: &mut Supervisor, query: &str, now: Instant) -> String {
                <td><span class=\"state {css}\">{statename}</span></td>\
                <td class=\"name\">{display}</td>\
                <td class=\"desc\">{desc}</td>\
-               <td class=\"actions\">\
-                 <a href=\"/?action=start&name={name}\">start</a>\
-                 <a href=\"/?action=stop&name={name}\">stop</a>\
-                 <a href=\"/?action=restart&name={name}\">restart</a>\
-               </td>\
+               <td class=\"actions\">{start}{stop}{restart}</td>\
              </tr>",
             css = css,
             statename = html_escape(&info.statename),
             display = html_escape(&namespec),
-            name = html_escape(&info.name),
             desc = html_escape(&info.description),
+            start = action_button("start", &info.name, "start"),
+            stop = action_button("stop", &info.name, "stop"),
+            restart = action_button("restart", &info.name, "restart"),
         ));
     }
     if rows.is_empty() {
@@ -70,9 +75,7 @@ pub fn render(sup: &mut Supervisor, query: &str, now: Instant) -> String {
            <header><h1>supervisor</h1><span class=\"ident\">{ident}</span></header>\
            {notice}\
            <div class=\"toolbar\">\
-             <a class=\"btn\" href=\"/?action=startall\">Start all</a>\
-             <a class=\"btn\" href=\"/?action=stopall\">Stop all</a>\
-             <a class=\"btn\" href=\"/?action=restartall\">Restart all</a>\
+             {start_all}{stop_all}{restart_all}\
              <a class=\"btn ghost\" href=\"/\">Refresh</a>\
            </div>\
            <table><thead><tr><th>State</th><th>Name</th><th>Description</th><th>Action</th></tr></thead>\
@@ -84,6 +87,35 @@ pub fn render(sup: &mut Supervisor, query: &str, now: Instant) -> String {
         notice = notice_html,
         rows = rows,
         ver = env!("CARGO_PKG_VERSION"),
+        start_all = toolbar_button("startall", "Start all"),
+        stop_all = toolbar_button("stopall", "Stop all"),
+        restart_all = toolbar_button("restartall", "Restart all"),
+    )
+}
+
+/// A small POST form rendering a single per-process action button.
+fn action_button(action: &str, name: &str, label: &str) -> String {
+    format!(
+        "<form method=\"post\" action=\"/\" class=\"act\">\
+           <input type=\"hidden\" name=\"action\" value=\"{action}\">\
+           <input type=\"hidden\" name=\"name\" value=\"{name}\">\
+           <button type=\"submit\">{label}</button>\
+         </form>",
+        action = html_escape(action),
+        name = html_escape(name),
+        label = html_escape(label),
+    )
+}
+
+/// A toolbar-wide POST action button (start/stop/restart all).
+fn toolbar_button(action: &str, label: &str) -> String {
+    format!(
+        "<form method=\"post\" action=\"/\" class=\"tb\">\
+           <input type=\"hidden\" name=\"action\" value=\"{action}\">\
+           <button type=\"submit\" class=\"btn\">{label}</button>\
+         </form>",
+        action = html_escape(action),
+        label = html_escape(label),
     )
 }
 
@@ -201,7 +233,12 @@ th,td{text-align:left;padding:.6rem 1.5rem;border-bottom:1px solid #1d222c;font-
 th{color:#8a93a6;font-weight:600;font-size:.75rem;text-transform:uppercase;letter-spacing:.05em}\
 .name{font-weight:600;color:#fff}\
 .desc{color:#8a93a6}\
-.actions a{color:#7aa2ff;text-decoration:none;margin-right:.6rem;font-size:.85rem}\
+.actions{display:flex;gap:.5rem}\
+.act{display:inline;margin:0}\
+.act button{background:none;border:none;color:#7aa2ff;cursor:pointer;font-size:.85rem;padding:0;font-family:inherit}\
+.act button:hover{text-decoration:underline}\
+.toolbar form{margin:0;display:inline}\
+.toolbar button{cursor:pointer;font-family:inherit}\
 .state{display:inline-block;min-width:5.5rem;padding:.15rem .5rem;border-radius:.3rem;font-size:.75rem;font-weight:700;text-align:center}\
 .state.ok{background:#10331c;color:#5fe08a}\
 .state.bad{background:#3a1414;color:#ff8a8a}\

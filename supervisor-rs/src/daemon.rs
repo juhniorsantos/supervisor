@@ -11,7 +11,8 @@ use std::io::{Read, Write};
 use std::net::TcpListener;
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{Config, HttpAuth};
@@ -33,12 +34,76 @@ extern "C" fn handle_term(_sig: i32) {
     SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
 }
 
+/// Write end of a self-pipe; the SIGCHLD handler pokes it so `poll` wakes
+/// immediately when a child exits. `-1` until the loop installs it.
+static SIGCHLD_PIPE_WRITE: AtomicI32 = AtomicI32::new(-1);
+
+extern "C" fn handle_sigchld(_sig: i32) {
+    let fd = SIGCHLD_PIPE_WRITE.load(Ordering::Relaxed);
+    if fd >= 0 {
+        // write() is async-signal-safe; a single byte is enough to wake poll.
+        let byte = [1u8];
+        unsafe {
+            libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
+        }
+    }
+}
+
 fn install_signal_handlers() {
     unsafe {
         libc::signal(libc::SIGTERM, handle_term as *const () as usize);
         libc::signal(libc::SIGINT, handle_term as *const () as usize);
+        libc::signal(libc::SIGCHLD, handle_sigchld as *const () as usize);
         libc::signal(libc::SIGPIPE, libc::SIG_IGN);
     }
+}
+
+/// Block until a control connection arrives, a child exits, or `timeout_ms`
+/// elapses — whichever comes first. Replaces a blind sleep so control and
+/// reaping are near-instant while timers still tick at the timeout cadence.
+fn poll_wait(unix_fd: i32, inet_fd: Option<i32>, sigchld_fd: i32, timeout_ms: i32) {
+    let mut fds = vec![
+        libc::pollfd {
+            fd: unix_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+        libc::pollfd {
+            fd: sigchld_fd,
+            events: libc::POLLIN,
+            revents: 0,
+        },
+    ];
+    if let Some(fd) = inet_fd {
+        fds.push(libc::pollfd {
+            fd,
+            events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    let rc = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, timeout_ms) };
+    if rc > 0 {
+        // Drain the self-pipe so it doesn't stay readable.
+        let mut buf = [0u8; 64];
+        loop {
+            let n =
+                unsafe { libc::read(sigchld_fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n <= 0 {
+                break;
+            }
+        }
+    }
+}
+
+/// Create the close-on-exec, non-blocking self-pipe used to wake `poll` on
+/// SIGCHLD. Returns `(read_fd, write_fd)`.
+fn make_self_pipe() -> (i32, i32) {
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+    if rc != 0 {
+        return (-1, -1);
+    }
+    (fds[0], fds[1])
 }
 
 /// The running supervisor: owns every process and the control endpoints.
@@ -140,6 +205,13 @@ impl Supervisor {
     /// of the daemon.
     pub fn run(&mut self) {
         install_signal_handlers();
+
+        // Self-pipe so SIGCHLD wakes poll() promptly for reaping.
+        let (sigchld_read, sigchld_write) = make_self_pipe();
+        SIGCHLD_PIPE_WRITE.store(sigchld_write, Ordering::SeqCst);
+        let unix_fd = self.listener.as_raw_fd();
+        let inet_fd = self.inet_listener.as_ref().map(|l| l.as_raw_fd());
+
         self.log_line(
             "INFO",
             &format!("supervisord started with pid {}", std::process::id()),
@@ -186,6 +258,8 @@ impl Supervisor {
 
             for i in 0..self.processes.len() {
                 self.processes[i].drain_output();
+                // Drain any queued stdin (sendProcessStdin) toward the child.
+                self.processes[i].pump_stdin();
                 let had_pid = self.processes[i].pid;
                 self.processes[i].transition(now, shutting_down);
                 let new_pid = self.processes[i].pid;
@@ -207,7 +281,17 @@ impl Supervisor {
                 break;
             }
 
-            std::thread::sleep(Duration::from_millis(100));
+            // Wait for the next control connection, child exit, or 100 ms
+            // timer tick — whichever is first.
+            poll_wait(unix_fd, inet_fd, sigchld_read, 100);
+        }
+
+        SIGCHLD_PIPE_WRITE.store(-1, Ordering::SeqCst);
+        if sigchld_read >= 0 {
+            unsafe {
+                libc::close(sigchld_read);
+                libc::close(sigchld_write);
+            }
         }
 
         self.log_line("INFO", "supervisord stopped");
@@ -236,7 +320,7 @@ impl Supervisor {
                 self.pid_index.remove(&pid);
                 self.processes[idx].on_reap(status, now);
                 let name = self.processes[idx].name().to_string();
-                let desc = self.processes[idx].status_description(now);
+                let desc = self.processes[idx].status_description(self.now_epoch());
                 self.log_line("INFO", &format!("exited: '{name}' ({desc})"));
             }
         }
@@ -383,7 +467,9 @@ impl Supervisor {
         }
 
         let path = req.path.clone();
-        if req.method == "POST" {
+        let route = path.split_once('?').map(|(p, _)| p).unwrap_or(&path);
+
+        if req.method == "POST" && route == "/RPC2" {
             // XML-RPC endpoint.
             match crate::xmlrpc::parse_method_call(&req.body) {
                 Ok((method, params)) => {
@@ -398,10 +484,15 @@ impl Supervisor {
                     crate::http::write_response(stream, 200, "OK", "text/xml", &body, &[]);
                 }
             }
+        } else if req.method == "POST" {
+            // Web UI action submitted as a form POST. Actions are never taken
+            // on a GET, so the page is safe to refresh/prefetch.
+            let params = web::parse_form(&req.body);
+            let html = web::render(self, &params, now);
+            crate::http::write_response(stream, 200, "OK", "text/html; charset=utf-8", &html, &[]);
         } else {
-            // Web UI (GET).
-            let query = path.split_once('?').map(|(_, q)| q).unwrap_or("");
-            let html = web::render(self, query, now);
+            // Web UI (GET): render status with no side effects.
+            let html = web::render(self, &[], now);
             crate::http::write_response(stream, 200, "OK", "text/html; charset=utf-8", &html, &[]);
         }
     }

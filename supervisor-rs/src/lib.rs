@@ -23,5 +23,6 @@ pub mod process;
 pub mod rpc;
 pub mod states;
 pub mod syslog;
+pub mod util;
 pub mod web;
 pub mod xmlrpc;

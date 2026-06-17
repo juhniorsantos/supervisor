@@ -255,6 +255,11 @@ impl Process {
         if self.pending_off >= self.pending_write.len() {
             self.pending_write.clear();
             self.pending_off = 0;
+        } else if self.pending_off > 0 {
+            // Compact: drop the bytes already flushed so the buffer only ever
+            // holds the outstanding tail (bounds memory for slow readers).
+            self.pending_write.drain(..self.pending_off);
+            self.pending_off = 0;
         }
     }
 
@@ -270,24 +275,23 @@ impl Process {
         self.pump_stdin();
     }
 
-    /// Write `data` to the process's stdin. Returns the number of bytes
-    /// written, or `None` if there is no stdin (process not running or the
-    /// pipe was closed by the child).
+    /// Maximum amount of unflushed stdin data we will buffer before refusing
+    /// more, to bound memory if the child never reads.
+    const MAX_STDIN_BUFFER: usize = 1 << 20; // 1 MiB
+
+    /// Queue `data` for the process's stdin and flush as much as the pipe will
+    /// accept now; the remainder is drained on subsequent ticks. Returns the
+    /// number of bytes accepted, or `None` if there is no stdin (not running)
+    /// or the buffer is full.
     pub fn write_stdin(&mut self, data: &[u8]) -> Option<usize> {
-        let fd = self.stdin_write.as_ref()?;
-        let n = unsafe {
-            libc::write(
-                fd.as_raw_fd(),
-                data.as_ptr() as *const libc::c_void,
-                data.len(),
-            )
-        };
-        // n < 0: EPIPE (child closed stdin) or EAGAIN; treat as closed.
-        if n < 0 {
-            None
-        } else {
-            Some(n as usize)
+        self.stdin_write.as_ref()?; // no stdin -> not running
+        let unflushed = self.pending_write.len() - self.pending_off;
+        if unflushed + data.len() > Self::MAX_STDIN_BUFFER {
+            return None;
         }
+        self.pending_write.extend_from_slice(data);
+        self.pump_stdin();
+        Some(data.len())
     }
 
     /// Send a UNIX signal to the running process (its process group). Returns
@@ -572,6 +576,16 @@ impl Process {
             }
             ProcessState::Exited => {
                 if !shutting_down && !self.administratively_stopped && self.should_restart() {
+                    // Throttle flapping: if the last run was very short (e.g.
+                    // a startsecs=0 program that exits immediately), wait until
+                    // at least one second has passed since it started before
+                    // respawning, so autorestart can't busy-loop. Long-running
+                    // processes restart immediately.
+                    if let Some(started) = self.laststart {
+                        if now < started + Duration::from_secs(1) {
+                            return;
+                        }
+                    }
                     self.spawn(now);
                 }
             }
@@ -858,15 +872,19 @@ impl Process {
         }
     }
 
-    /// One-line status description, mirroring `supervisorctl status`.
-    pub fn status_description(&self, now: Instant) -> String {
+    /// One-line status description for logs. Uptime is computed from the same
+    /// wall-clock start time the API snapshot ([`Process::info`]) uses, so a
+    /// process reads the same uptime everywhere.
+    pub fn status_description(&self, now_epoch: i64) -> String {
         match self.state {
             ProcessState::Running => {
-                let up = self
-                    .laststart
-                    .map(|t| now.duration_since(t))
-                    .unwrap_or_default();
-                format!("pid {}, uptime {}", self.pid, fmt_duration(up))
+                let start = self
+                    .laststart_sys
+                    .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                    .map(|d| d.as_secs() as i64)
+                    .unwrap_or(now_epoch);
+                let up = (now_epoch - start).max(0) as u64;
+                format!("pid {}, uptime {}", self.pid, fmt_duration(Duration::from_secs(up)))
             }
             ProcessState::Stopped => "Not started".to_string(),
             ProcessState::Starting => "starting".to_string(),
@@ -1057,7 +1075,7 @@ fn scan_capture(
 
     loop {
         if !state.in_capture {
-            if let Some(i) = find_subslice(&state.buf, CAPTURE_BEGIN) {
+            if let Some(i) = crate::util::find_subslice(&state.buf, CAPTURE_BEGIN) {
                 logger.write(&state.buf[..i]);
                 state.buf.drain(..i + CAPTURE_BEGIN.len());
                 state.in_capture = true;
@@ -1069,7 +1087,7 @@ fn scan_capture(
                 state.buf.drain(..flush_to);
                 break;
             }
-        } else if let Some(i) = find_subslice(&state.buf, CAPTURE_END) {
+        } else if let Some(i) = crate::util::find_subslice(&state.buf, CAPTURE_END) {
             append_capped(&mut state.captured, &state.buf[..i], maxbytes);
             state.buf.drain(..i + CAPTURE_END.len());
             state.in_capture = false;
@@ -1102,13 +1120,6 @@ fn prefix_overlap(buf: &[u8], token: &[u8]) -> usize {
         }
     }
     0
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack.windows(needle.len()).position(|w| w == needle)
 }
 
 fn drain_fd(fd: i32, logger: &mut RotatingLogger) {
@@ -1432,6 +1443,67 @@ mod tests {
         assert!(p.subscribed_to("TICK_60"));
         assert!(!p.subscribed_to("TICK_5"));
         assert!(!p.subscribed_to("PROCESS_COMMUNICATION_STDOUT"));
+    }
+
+    #[test]
+    fn autorestart_throttles_a_flapping_process() {
+        // A startsecs=0 autorestart=true program that exits instantly must not
+        // be respawned in the same sub-second window (which would busy-loop).
+        let mut p = make_proc("autorestart=true\nstartsecs=0");
+        p.state = ProcessState::Exited;
+        p.exitstatus = Some(0);
+        p.laststart = Some(Instant::now()); // started "just now"
+        p.transition(Instant::now(), false);
+        // No fork happened: still Exited with no pid.
+        assert_eq!(p.state, ProcessState::Exited);
+        assert_eq!(p.pid, 0);
+    }
+
+    #[test]
+    fn write_stdin_buffers_and_respects_its_cap() {
+        let (read, write) = make_stdin_pipe().unwrap();
+        unsafe {
+            let fl = libc::fcntl(read.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(read.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        let mut p = make_proc("");
+        p.stdin_write = Some(write);
+
+        // A write larger than the pipe buffer is accepted in full and buffered.
+        let big = vec![b'y'; 200_000];
+        assert_eq!(p.write_stdin(&big), Some(big.len()));
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65536];
+        for _ in 0..1000 {
+            p.pump_stdin();
+            loop {
+                let n = unsafe {
+                    libc::read(read.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+                if n > 0 {
+                    got.extend_from_slice(&buf[..n as usize]);
+                } else {
+                    break;
+                }
+            }
+            if !p.has_pending_write() {
+                break;
+            }
+        }
+        assert_eq!(got.len(), big.len());
+        assert!(got.iter().all(|&b| b == b'y'));
+
+        // Exceeding the 1 MiB buffer cap is refused rather than growing without
+        // bound.
+        let toobig = vec![0u8; Process::MAX_STDIN_BUFFER + 1];
+        assert_eq!(p.write_stdin(&toobig), None);
+    }
+
+    #[test]
+    fn write_stdin_without_pipe_returns_none() {
+        let mut p = make_proc("");
+        assert_eq!(p.write_stdin(b"data"), None);
     }
 
     #[test]

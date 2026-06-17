@@ -40,7 +40,7 @@ pub fn read_request<S: Read>(stream: &mut S) -> Option<Request> {
 
     // Read until we have the full header block.
     let header_end = loop {
-        if let Some(pos) = find_subslice(&buf, b"\r\n\r\n") {
+        if let Some(pos) = crate::util::find_subslice(&buf, b"\r\n\r\n") {
             break pos + 4;
         }
         match stream.read(&mut chunk) {
@@ -119,15 +119,6 @@ pub fn write_response<S: Write>(
     let _ = stream.write_all(head.as_bytes());
     let _ = stream.write_all(body.as_bytes());
     let _ = stream.flush();
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() || haystack.len() < needle.len() {
-        return None;
-    }
-    haystack
-        .windows(needle.len())
-        .position(|w| w == needle)
 }
 
 /// Minimal standard base64 decoder (no external crates).
