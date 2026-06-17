@@ -76,6 +76,9 @@ pub struct Process {
     /// Capture-mode scanners for the stdout/stderr communication protocol.
     stdout_capture: CaptureState,
     stderr_capture: CaptureState,
+    /// Optional syslog forwarders for stdout/stderr.
+    stdout_syslog: Option<crate::syslog::Syslog>,
+    stderr_syslog: Option<crate::syslog::Syslog>,
     /// Event names this listener subscribes to (concrete or abstract).
     subscribed: std::collections::HashSet<String>,
     /// Buffered events awaiting delivery: `(serial, name, payload)`.
@@ -113,6 +116,12 @@ impl Process {
     /// against `childlogdir`.
     pub fn new(config: ProgramConfig, childlogdir: &std::path::Path) -> Self {
         let config_events = config.events.clone();
+        let stdout_syslog_writer = config
+            .stdout_syslog
+            .then(|| crate::syslog::Syslog::new(&config.name));
+        let stderr_syslog_writer = config
+            .stderr_syslog
+            .then(|| crate::syslog::Syslog::new(&config.name));
         let stdout_logger = make_logger(
             &config.stdout_logfile,
             childlogdir,
@@ -164,6 +173,8 @@ impl Process {
             pool_serial: 0,
             stdout_capture: CaptureState::default(),
             stderr_capture: CaptureState::default(),
+            stdout_syslog: stdout_syslog_writer,
+            stderr_syslog: stderr_syslog_writer,
             subscribed: config_events.into_iter().collect(),
             event_buffer: std::collections::VecDeque::new(),
         }
@@ -671,8 +682,14 @@ impl Process {
         } else {
             self.config.stderr_capture_maxbytes
         };
+        let syslog_enabled = if is_stdout {
+            self.stdout_syslog.is_some()
+        } else {
+            self.stderr_syslog.is_some()
+        };
 
-        if maxbytes == 0 {
+        // Fast path: no capture and no syslog — stream straight to the logger.
+        if maxbytes == 0 && !syslog_enabled {
             let logger = if is_stdout {
                 &mut self.stdout_logger
             } else {
@@ -682,7 +699,7 @@ impl Process {
             return;
         }
 
-        // Capture-enabled: read available bytes, then run the scanner.
+        // Read all available bytes, then fan out to syslog/capture/logger.
         let mut data = Vec::new();
         let mut buf = [0u8; 8192];
         loop {
@@ -694,6 +711,26 @@ impl Process {
             }
         }
         if data.is_empty() {
+            return;
+        }
+
+        // Forward to syslog (a separate field, so no borrow conflict below).
+        let syslog = if is_stdout {
+            self.stdout_syslog.as_mut()
+        } else {
+            self.stderr_syslog.as_mut()
+        };
+        if let Some(sl) = syslog {
+            sl.feed(&data);
+        }
+
+        if maxbytes == 0 {
+            let logger = if is_stdout {
+                &mut self.stdout_logger
+            } else {
+                &mut self.stderr_logger
+            };
+            logger.write(&data);
             return;
         }
 

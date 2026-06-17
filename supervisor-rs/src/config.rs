@@ -77,6 +77,9 @@ pub struct ProgramConfig {
     /// `PROCESS_COMMUNICATION_*` event (up to this many bytes).
     pub stdout_capture_maxbytes: u64,
     pub stderr_capture_maxbytes: u64,
+    /// Also forward stdout/stderr lines to the system log (`/dev/log`).
+    pub stdout_syslog: bool,
+    pub stderr_syslog: bool,
     /// True for `[eventlistener:x]` sections: the process speaks the event
     /// notification protocol on its stdin/stdout.
     pub is_listener: bool,
@@ -725,6 +728,8 @@ fn parse_program(
     let stderr_logfile_backups = m.get("stderr_logfile_backups").map(|v| v.parse()).transpose().map_err(|_| "invalid stderr_logfile_backups")?.unwrap_or(10);
     let stdout_capture_maxbytes = m.get("stdout_capture_maxbytes").map(|v| parse_byte_size(v)).transpose()?.unwrap_or(0);
     let stderr_capture_maxbytes = m.get("stderr_capture_maxbytes").map(|v| parse_byte_size(v)).transpose()?.unwrap_or(0);
+    let stdout_syslog = m.get("stdout_syslog").map(|v| parse_bool(v)).transpose()?.unwrap_or(false);
+    let stderr_syslog = m.get("stderr_syslog").map(|v| parse_bool(v)).transpose()?.unwrap_or(false);
 
     let mut environment = supervisord.environment.clone();
     if let Some(v) = m.get("environment") {
@@ -765,6 +770,8 @@ fn parse_program(
             stderr_logfile_backups,
             stdout_capture_maxbytes,
             stderr_capture_maxbytes,
+            stdout_syslog,
+            stderr_syslog,
             is_listener,
             events: events.clone(),
             buffer_size,

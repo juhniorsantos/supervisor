@@ -61,6 +61,7 @@ The crate is split into focused modules (`src/`):
 | `xmlrpc.rs`   | A dependency-free XML-RPC parser/serializer. |
 | `rpc.rs`      | The `supervisor.*` XML-RPC method set (API 3.0). |
 | `events.rs`   | Event names, payloads and listener-subscription matching. |
+| `syslog.rs`   | Minimal line-buffered syslog client (`/dev/log`). |
 | `web.rs`      | The web management UI served at `GET /`. |
 | `control.rs`  | XML-RPC-over-HTTP client used by `supervisorctl`. |
 | `bin/supervisord.rs`   | Daemon entry point (arg parsing, daemonize, pidfile). |
@@ -89,8 +90,11 @@ Implemented RPC methods: `getAPIVersion`/`getVersion`,
 `getAllProcessInfo`, `getProcessInfo`, `startProcess`, `stopProcess`,
 `startProcessGroup`, `stopProcessGroup`, `startAllProcesses`,
 `stopAllProcesses`, `readProcessStdoutLog`/`readProcessStderrLog`,
-`tailProcessStdoutLog`/`tailProcessStderrLog`, `shutdown`, `restart`. HTTP
-Basic auth (`username=`/`password=`) is enforced when configured.
+`tailProcessStdoutLog`/`tailProcessStderrLog`, `signalProcess`/`Group`/`All`,
+`clearProcessLogs`/`clearAllProcessLogs`, `clearLog`, `readLog`,
+`sendProcessStdin`, `sendRemoteCommEvent`, `reloadConfig`,
+`addProcessGroup`/`removeProcessGroup`, `shutdown`, `restart`. HTTP Basic auth
+(`username=`/`password=`) is enforced when configured.
 
 ## Supported configuration
 
@@ -116,7 +120,8 @@ config's directory).
 `autostart`, `autorestart` (`true`/`false`/`unexpected`), `startsecs`,
 `startretries`, `exitcodes`, `stopsignal`, `stopwaitsecs`, `environment`,
 `user`, `umask`, `priority`, `redirect_stderr`, `stdout_logfile`(+`_maxbytes`,
-`_backups`), `stderr_logfile`(+`_maxbytes`, `_backups`).
+`_backups`, `_capture_maxbytes`, `_syslog`), `stderr_logfile`(+`_maxbytes`,
+`_backups`, `_capture_maxbytes`, `_syslog`).
 
 ## Control commands
 
@@ -156,12 +161,19 @@ Implemented (the MVP you asked for):
       `reread`/`update`/`add`/`remove` (`reloadConfig`, `addProcessGroup`,
       `removeProcessGroup` RPC) to add/remove/restart groups without a full
       restart
+- [x] **Signals & logs**: `signalProcess`/`Group`/`All`, `clearProcessLogs`/
+      `clearAllProcessLogs`, `clearLog`, `readLog`, `sendProcessStdin`,
+      `sendRemoteCommEvent`; `supervisorctl signal`/`clear`/`maintail`/`fg`
+- [x] **Log capture mode**: `stdout/stderr_capture_maxbytes` →
+      `PROCESS_COMMUNICATION_*` events
+- [x] **Syslog output**: `stdout_syslog`/`stderr_syslog` forward lines to
+      `/dev/log`
 
-Not yet ported (natural next phases):
+Not yet ported (smaller remaining bits):
 
-- [ ] `supervisorctl fg`, log capture mode (`PROCESS_COMMUNICATION` events)
-- [ ] Syslog output
-- [ ] Additional RPC methods (`signalProcess`, `clearLog`, `sendProcessStdin`, …)
+- [ ] `fcgi-program:x` sections
+- [ ] A few niche RPC methods (`getProcessInfo` for `group:*` wildcards,
+      `tail` overflow semantics) and `loglevel`-to-syslog for the main log
 
 ## Tests
 

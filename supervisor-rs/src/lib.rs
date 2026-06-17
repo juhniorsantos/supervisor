@@ -22,5 +22,6 @@ pub mod logger;
 pub mod process;
 pub mod rpc;
 pub mod states;
+pub mod syslog;
 pub mod web;
 pub mod xmlrpc;
