@@ -17,6 +17,7 @@ pub mod faults {
     pub const UNKNOWN_METHOD: i32 = 1;
     pub const INCORRECT_PARAMETERS: i32 = 2;
     pub const BAD_NAME: i32 = 10;
+    pub const BAD_SIGNAL: i32 = 11;
     pub const NO_FILE: i32 = 20;
     pub const FAILED: i32 = 30;
     pub const SPAWN_ERROR: i32 = 50;
@@ -111,6 +112,56 @@ pub fn dispatch(
         "readProcessStderrLog" => read_log(sup, params, "stderr"),
         "tailProcessStdoutLog" => tail_log(sup, params, "stdout"),
         "tailProcessStderrLog" => tail_log(sup, params, "stderr"),
+        "readLog" | "readMainLog" => {
+            let offset = int_param(params, 0).unwrap_or(0);
+            let length = int_param(params, 1).unwrap_or(0);
+            Ok(Value::Str(sup.read_main_log(offset, length)?))
+        }
+        "clearLog" => {
+            sup.clear_main_log()?;
+            Ok(Value::Bool(true))
+        }
+
+        "signalProcess" => {
+            let name = str_param(params, 0)?;
+            let sig = signal_param(params, 1)?;
+            sup.op_signal(&name, sig)?;
+            Ok(Value::Bool(true))
+        }
+        "signalProcessGroup" => {
+            let name = str_param(params, 0)?;
+            let sig = signal_param(params, 1)?;
+            let results = sup.op_signal_group(&name, sig);
+            Ok(results_array(&results))
+        }
+        "signalAllProcesses" => {
+            let sig = signal_param(params, 0)?;
+            let results = sup.op_signal_all(sig);
+            Ok(results_array(&results))
+        }
+
+        "clearProcessLogs" => {
+            let name = str_param(params, 0)?;
+            sup.op_clear_logs(&name)?;
+            Ok(Value::Bool(true))
+        }
+        "clearAllProcessLogs" => {
+            let results = sup.op_clear_all_logs();
+            Ok(results_array(&results))
+        }
+
+        "sendProcessStdin" => {
+            let name = str_param(params, 0)?;
+            let chars = str_param(params, 1)?;
+            sup.op_send_stdin(&name, &chars)?;
+            Ok(Value::Bool(true))
+        }
+        "sendRemoteCommEvent" => {
+            let kind = str_param(params, 0)?;
+            let data = str_param(params, 1)?;
+            sup.op_send_remote_comm_event(&kind, &data);
+            Ok(Value::Bool(true))
+        }
 
         "reloadConfig" => {
             let (added, changed, removed) = sup.reload_config()?;
@@ -196,6 +247,30 @@ fn info_to_value(info: &ProcessInfo) -> Value {
         ("pid".into(), Value::Int(info.pid as i64)),
         ("description".into(), Value::Str(info.description.clone())),
     ])
+}
+
+/// Build an XML-RPC array from `(name, group, status, description)` tuples.
+fn results_array(results: &[(String, String, i32, String)]) -> Value {
+    Value::Array(
+        results
+            .iter()
+            .map(|(n, g, c, d)| result_struct(n, g, *c, d))
+            .collect(),
+    )
+}
+
+/// Parse a signal parameter, which may be a name (`HUP`, `SIGTERM`) or a
+/// number (`1`, `15`).
+fn signal_param(params: &[Value], i: usize) -> Result<i32, (i32, String)> {
+    let raw = match params.get(i) {
+        Some(Value::Int(n)) => return Ok(*n as i32),
+        Some(Value::Str(s)) => s.clone(),
+        _ => return Err((faults::INCORRECT_PARAMETERS, format!("expected signal param {i}"))),
+    };
+    if let Ok(n) = raw.trim().parse::<i32>() {
+        return Ok(n);
+    }
+    crate::config::parse_signal(&raw).map_err(|_| (faults::BAD_SIGNAL, raw))
 }
 
 fn result_struct(name: &str, group: &str, status: i32, description: &str) -> Value {

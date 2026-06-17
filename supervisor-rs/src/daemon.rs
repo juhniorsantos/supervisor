@@ -668,6 +668,117 @@ impl Supervisor {
         Ok(String::from_utf8_lossy(slice).into_owned())
     }
 
+    /// Read up to `length` bytes of the main supervisord log from `offset`.
+    pub fn read_main_log(&self, offset: i64, length: i64) -> Result<String, (i32, String)> {
+        let path = &self.config.supervisord.logfile;
+        if !path.exists() {
+            return Err((rpc::faults::NO_FILE, path.display().to_string()));
+        }
+        let data = std::fs::read(path).map_err(|e| (rpc::faults::FAILED, e.to_string()))?;
+        let start = (offset.max(0) as usize).min(data.len());
+        let slice = if length <= 0 {
+            &data[start..]
+        } else {
+            let end = (start + length as usize).min(data.len());
+            &data[start..end]
+        };
+        Ok(String::from_utf8_lossy(slice).into_owned())
+    }
+
+    /// Clear (truncate) the main supervisord log.
+    pub fn clear_main_log(&mut self) -> Result<(), (i32, String)> {
+        self.log.clear();
+        Ok(())
+    }
+
+    /// Send a UNIX signal to a process by name.
+    pub fn op_signal(&mut self, name: &str, sig: i32) -> Result<(), (i32, String)> {
+        let idx = self
+            .find(name)
+            .ok_or((rpc::faults::BAD_NAME, name.to_string()))?;
+        if !self.processes[idx].signal(sig) {
+            return Err((rpc::faults::NOT_RUNNING, name.to_string()));
+        }
+        Ok(())
+    }
+
+    /// Signal every process in a group.
+    pub fn op_signal_group(&mut self, group: &str, sig: i32) -> Vec<(String, String, i32, String)> {
+        let names: Vec<String> = self
+            .processes
+            .iter()
+            .filter(|p| p.config.group == group)
+            .map(|p| p.name().to_string())
+            .collect();
+        names
+            .into_iter()
+            .map(|name| match self.op_signal(&name, sig) {
+                Ok(()) => (name, group.to_string(), rpc::faults::SUCCESS, "signalled".into()),
+                Err((c, _)) => (name, group.to_string(), c, fault_message(c)),
+            })
+            .collect()
+    }
+
+    /// Signal every process.
+    pub fn op_signal_all(&mut self, sig: i32) -> Vec<(String, String, i32, String)> {
+        let entries: Vec<(String, String)> = self
+            .processes
+            .iter()
+            .map(|p| (p.name().to_string(), p.config.group.clone()))
+            .collect();
+        entries
+            .into_iter()
+            .map(|(name, group)| match self.op_signal(&name, sig) {
+                Ok(()) => (name, group, rpc::faults::SUCCESS, "signalled".into()),
+                Err((c, _)) => (name, group, c, fault_message(c)),
+            })
+            .collect()
+    }
+
+    /// Truncate a process's stdout/stderr logs.
+    pub fn op_clear_logs(&mut self, name: &str) -> Result<(), (i32, String)> {
+        let idx = self
+            .find(name)
+            .ok_or((rpc::faults::BAD_NAME, name.to_string()))?;
+        self.processes[idx].clear_logs();
+        Ok(())
+    }
+
+    /// Truncate every process's logs.
+    pub fn op_clear_all_logs(&mut self) -> Vec<(String, String, i32, String)> {
+        let mut out = Vec::new();
+        for p in &mut self.processes {
+            p.clear_logs();
+            out.push((
+                p.name().to_string(),
+                p.config.group.clone(),
+                rpc::faults::SUCCESS,
+                "cleared".to_string(),
+            ));
+        }
+        out
+    }
+
+    /// Write `data` to a process's stdin.
+    pub fn op_send_stdin(&mut self, name: &str, data: &str) -> Result<(), (i32, String)> {
+        let idx = self
+            .find(name)
+            .ok_or((rpc::faults::BAD_NAME, name.to_string()))?;
+        if self.processes[idx].state != crate::states::ProcessState::Running {
+            return Err((rpc::faults::NOT_RUNNING, name.to_string()));
+        }
+        match self.processes[idx].write_stdin(data.as_bytes()) {
+            Some(_) => Ok(()),
+            None => Err((rpc::faults::NO_FILE, name.to_string())),
+        }
+    }
+
+    /// Emit a REMOTE_COMMUNICATION event into the listener subsystem.
+    pub fn op_send_remote_comm_event(&mut self, kind: &str, data: &str) {
+        let payload = format!("type:{kind}\n{data}");
+        self.buffer_to_listeners("REMOTE_COMMUNICATION", payload);
+    }
+
     /// Find a process index by its name (also accepts the `group:name`
     /// namespec where group == name).
     fn find(&self, name: &str) -> Option<usize> {

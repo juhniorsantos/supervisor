@@ -90,6 +90,13 @@ fn run_command(socket: &Path, argv: &[String]) {
         "update" => cmd_update(socket, args),
         "add" => cmd_add(socket, args),
         "remove" => cmd_remove(socket, args),
+        "signal" => cmd_signal(socket, args),
+        "clear" => cmd_clear(socket, args),
+        "fg" => cmd_fg(socket, args),
+        "maintail" => match call(socket, "supervisor.readLog", &[Value::Int(0), Value::Int(0)]) {
+            Ok(v) => print!("{}", as_str(&v)),
+            Err(e) => fail_call(socket, e),
+        },
         "version" => match call(socket, "supervisor.getSupervisorVersion", &[]) {
             Ok(v) => println!("{}", as_str(&v)),
             Err(e) => fail_call(socket, e),
@@ -223,6 +230,134 @@ fn cmd_pid(socket: &Path, args: &[String]) {
             Err(e) => fail_call(socket, e),
         },
     }
+}
+
+fn cmd_signal(socket: &Path, args: &[String]) {
+    if args.len() < 2 {
+        return println!("Error: signal requires a signal name and a process name");
+    }
+    let sig = &args[0];
+    let names = &args[1..];
+    if names.iter().any(|a| a == "all") {
+        match call(socket, "supervisor.signalAllProcesses", &[Value::Str(sig.clone())]) {
+            Ok(Value::Array(results)) => {
+                for r in &results {
+                    let name = get_str(r, "name");
+                    let code = get_int(r, "status") as i32;
+                    if code == 80 {
+                        println!("{name}: signalled");
+                    } else {
+                        println!("{}", result_error(&name, code));
+                    }
+                }
+            }
+            Ok(_) => {}
+            Err(e) => fail_call(socket, e),
+        }
+        return;
+    }
+    for name in names {
+        match call(
+            socket,
+            "supervisor.signalProcess",
+            &[Value::Str(name.clone()), Value::Str(sig.clone())],
+        ) {
+            Ok(_) => println!("{name}: signalled"),
+            Err(ClientError::Fault(code, _)) => println!("{}", result_error(name, code)),
+            Err(e) => return fail_call(socket, e),
+        }
+    }
+}
+
+fn cmd_clear(socket: &Path, args: &[String]) {
+    if args.is_empty() {
+        return println!("Error: clear requires a process name");
+    }
+    if args.iter().any(|a| a == "all") {
+        match call(socket, "supervisor.clearAllProcessLogs", &[]) {
+            Ok(Value::Array(results)) => {
+                for r in &results {
+                    println!("{}: cleared", get_str(r, "name"));
+                }
+            }
+            Ok(_) => {}
+            Err(e) => fail_call(socket, e),
+        }
+        return;
+    }
+    for name in args {
+        match call(socket, "supervisor.clearProcessLogs", &[Value::Str(name.clone())]) {
+            Ok(_) => println!("{name}: cleared"),
+            Err(ClientError::Fault(code, _)) => println!("{}", result_error(name, code)),
+            Err(e) => return fail_call(socket, e),
+        }
+    }
+}
+
+/// Foreground a running process: stream its stdout to the terminal and
+/// forward terminal stdin to the process. Exit with Ctrl-D (EOF).
+fn cmd_fg(socket: &Path, args: &[String]) {
+    let Some(name) = args.first() else {
+        return println!("ERROR: no process name supplied");
+    };
+    match call(socket, "supervisor.getProcessInfo", &[Value::Str(name.clone())]) {
+        Ok(info) => {
+            if get_int(&info, "state") != 20 {
+                return println!("ERROR: process not running");
+            }
+        }
+        Err(_) => return println!("ERROR: bad process name supplied"),
+    }
+    println!("==> Press Ctrl-D to exit <==");
+
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    let stop = Arc::new(AtomicBool::new(false));
+
+    // Background thread: follow the process stdout log.
+    let tail_stop = stop.clone();
+    let tail_socket = socket.to_path_buf();
+    let tail_name = name.clone();
+    let handle = std::thread::spawn(move || {
+        let mut offset: i64 = 0;
+        while !tail_stop.load(Ordering::Relaxed) {
+            if let Ok(Value::Array(parts)) = control::call(
+                &tail_socket,
+                "supervisor.tailProcessStdoutLog",
+                &[Value::Str(tail_name.clone()), Value::Int(offset), Value::Int(4096)],
+            ) {
+                if let (Some(data), Some(Value::Int(newoff))) = (parts.first(), parts.get(1)) {
+                    let text = as_str(data);
+                    if !text.is_empty() {
+                        print!("{text}");
+                        io::stdout().flush().ok();
+                    }
+                    offset = *newoff;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+    });
+
+    // Foreground: forward our stdin to the process.
+    let stdin = io::stdin();
+    loop {
+        let mut line = String::new();
+        match stdin.lock().read_line(&mut line) {
+            Ok(0) => break, // Ctrl-D
+            Ok(_) => {}
+            Err(_) => break,
+        }
+        match call(socket, "supervisor.sendProcessStdin", &[Value::Str(name.clone()), Value::Str(line)]) {
+            Ok(_) => {}
+            Err(_) => {
+                println!("Process got killed; exiting foreground");
+                break;
+            }
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    let _ = handle.join();
 }
 
 fn cmd_tail(socket: &Path, args: &[String]) {
@@ -391,6 +526,7 @@ fn print_results(results: &[Value]) {
 fn result_error(name: &str, code: i32) -> String {
     let reason = match code {
         10 => "no such process",
+        11 => "bad signal",
         20 => "no such file",
         21 => "file is not executable",
         50 => "spawn error",
@@ -506,7 +642,11 @@ fn print_usage() {
          \x20 start  <name|all>      start process(es)\n\
          \x20 stop   <name|all>      stop process(es)\n\
          \x20 restart <name|all>     restart process(es)\n\
+         \x20 signal <SIG> <name|all> send a signal to process(es)\n\
+         \x20 clear  <name|all>      clear process log(s)\n\
          \x20 tail   <name> [stderr] show a process log\n\
+         \x20 fg     <name>          attach to a running process\n\
+         \x20 maintail               show the main supervisord log\n\
          \x20 reread                 re-read config, report changes\n\
          \x20 update [group|all]     apply config changes (add/remove/restart groups)\n\
          \x20 add    <group>         activate a group from the config\n\

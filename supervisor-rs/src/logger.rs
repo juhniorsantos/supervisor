@@ -66,6 +66,23 @@ impl RotatingLogger {
         }
     }
 
+    /// Truncate the current log and delete its rotated backups.
+    pub fn clear(&mut self) {
+        let Some(path) = self.path.clone() else { return };
+        self.file = None;
+        for i in 1..=self.backups {
+            let _ = std::fs::remove_file(backup_path(&path, i));
+        }
+        // Truncate the active file, then reopen for appending.
+        let _ = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .create(true)
+            .open(&path);
+        self.file = OpenOptions::new().create(true).append(true).open(&path).ok();
+        self.size = 0;
+    }
+
     fn rotate(&mut self) {
         let Some(path) = self.path.clone() else { return };
         // Drop the current handle before renaming.

@@ -61,8 +61,10 @@ pub struct Process {
     /// tick by the supervisor and routed to event listeners.
     pub pending_events: Vec<(String, String)>,
     // --- Event listener protocol state (only used when `is_listener`) ------
-    /// Write end of the listener's stdin; the supervisor sends events here.
-    listener_stdin: Option<OwnedFd>,
+    /// Write end of the child's stdin. For event listeners the supervisor
+    /// writes event envelopes here; for ordinary programs it carries
+    /// `sendProcessStdin` data.
+    stdin_write: Option<OwnedFd>,
     pub listener_state: ListenerState,
     /// Unparsed bytes read from the listener's stdout protocol stream.
     listener_buf: Vec<u8>,
@@ -139,7 +141,7 @@ impl Process {
             stderr_read: None,
             last_exit_expected: true,
             pending_events: Vec::new(),
-            listener_stdin: None,
+            stdin_write: None,
             listener_state: ListenerState::Acknowledged,
             listener_buf: Vec::new(),
             result_len: None,
@@ -189,7 +191,7 @@ impl Process {
     /// Write an event envelope to the listener's stdin and mark it BUSY.
     /// Returns true if the write succeeded and the event was consumed.
     pub fn send_event(&mut self, envelope: &[u8]) -> bool {
-        let Some(fd) = self.listener_stdin.as_ref() else {
+        let Some(fd) = self.stdin_write.as_ref() else {
             return false;
         };
         let n = unsafe {
@@ -206,6 +208,45 @@ impl Process {
         } else {
             false
         }
+    }
+
+    /// Write `data` to the process's stdin. Returns the number of bytes
+    /// written, or `None` if there is no stdin (process not running or the
+    /// pipe was closed by the child).
+    pub fn write_stdin(&mut self, data: &[u8]) -> Option<usize> {
+        let fd = self.stdin_write.as_ref()?;
+        let n = unsafe {
+            libc::write(
+                fd.as_raw_fd(),
+                data.as_ptr() as *const libc::c_void,
+                data.len(),
+            )
+        };
+        // n < 0: EPIPE (child closed stdin) or EAGAIN; treat as closed.
+        if n < 0 {
+            None
+        } else {
+            Some(n as usize)
+        }
+    }
+
+    /// Send a UNIX signal to the running process (its process group). Returns
+    /// true if the process is in a signallable state.
+    pub fn signal(&self, sig: i32) -> bool {
+        if !matches!(
+            self.state,
+            ProcessState::Running | ProcessState::Starting | ProcessState::Stopping
+        ) {
+            return false;
+        }
+        self.send_signal(sig);
+        true
+    }
+
+    /// Truncate this process's stdout/stderr logs (and their rotations).
+    pub fn clear_logs(&mut self) {
+        self.stdout_logger.clear();
+        self.stderr_logger.clear();
     }
 
     pub fn name(&self) -> &str {
@@ -236,24 +277,20 @@ impl Process {
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
 
-        // Event listeners receive events on stdin; give them a pipe we write
-        // to. Ordinary programs get /dev/null.
-        let mut stdin_write: Option<OwnedFd> = None;
-        if self.config.is_listener {
-            match make_blocking_pipe() {
-                Ok((r, w)) => {
-                    cmd.stdin(Stdio::from(r));
-                    stdin_write = Some(w);
-                }
-                Err(e) => {
-                    self.spawnerr = Some(format!("pipe failed: {e}"));
-                    self.fail_to_backoff(now);
-                    return;
-                }
+        // Every process gets a stdin pipe we keep the write end of: event
+        // listeners receive event envelopes there, ordinary programs receive
+        // `sendProcessStdin` data. The child's read end stays blocking; our
+        // write end is non-blocking so we never stall the event loop.
+        let (stdin_read, stdin_write) = match make_stdin_pipe() {
+            Ok(pair) => pair,
+            Err(e) => {
+                self.spawnerr = Some(format!("pipe failed: {e}"));
+                self.fail_to_backoff(now);
+                return;
             }
-        } else {
-            cmd.stdin(Stdio::null());
-        }
+        };
+        cmd.stdin(Stdio::from(stdin_read));
+        let stdin_write = Some(stdin_write);
 
         let mut err_read: Option<OwnedFd> = None;
         if self.config.redirect_stderr {
@@ -335,8 +372,8 @@ impl Process {
                 self.spawnerr = None;
                 self.stdout_read = Some(out_r);
                 self.stderr_read = err_read;
+                self.stdin_write = stdin_write;
                 if self.config.is_listener {
-                    self.listener_stdin = stdin_write;
                     self.listener_state = ListenerState::Acknowledged;
                     self.listener_buf.clear();
                     self.result_len = None;
@@ -395,8 +432,8 @@ impl Process {
         let expected = !signaled && self.config.exitcodes.contains(&es);
         self.last_exit_expected = expected;
         self.laststop_sys = Some(SystemTime::now());
-        // Listener pipes are gone once the process exits.
-        self.listener_stdin = None;
+        // The stdin pipe is gone once the process exits.
+        self.stdin_write = None;
 
         match self.state {
             ProcessState::Starting => {
@@ -883,18 +920,24 @@ fn make_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     Ok((read, write))
 }
 
-/// Create a close-on-exec pipe with both ends left in blocking mode. Used for
-/// an event listener's stdin, which the child reads with ordinary blocking
-/// reads. Returns `(read, write)`.
-fn make_blocking_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+/// Create a close-on-exec pipe for a child's stdin: the read end (handed to
+/// the child) stays blocking so the child reads normally, while our write end
+/// is non-blocking so writing never stalls the event loop. Returns
+/// `(read, write)`.
+fn make_stdin_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     use std::os::fd::FromRawFd;
     let mut fds = [0i32; 2];
     let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
+    let write = fds[1];
+    unsafe {
+        let flags = libc::fcntl(write, libc::F_GETFL);
+        libc::fcntl(write, libc::F_SETFL, flags | libc::O_NONBLOCK);
+    }
     let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
+    let write = unsafe { OwnedFd::from_raw_fd(write) };
     Ok((read, write))
 }
 

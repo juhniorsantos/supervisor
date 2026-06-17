@@ -61,6 +61,8 @@ pub fn process_state_payload(
 pub fn ancestors(event_name: &str) -> Vec<&'static str> {
     if event_name.starts_with("PROCESS_STATE") {
         vec![leak(event_name), "PROCESS_STATE", "EVENT"]
+    } else if event_name.starts_with("PROCESS_COMMUNICATION") {
+        vec![leak(event_name), "PROCESS_COMMUNICATION", "EVENT"]
     } else if event_name.starts_with("TICK") {
         vec![leak(event_name), "TICK", "EVENT"]
     } else if event_name.starts_with("SUPERVISOR_STATE_CHANGE") {
@@ -91,11 +93,14 @@ fn leak(s: &str) -> &'static str {
         "PROCESS_STATE_EXITED",
         "PROCESS_STATE_FATAL",
         "PROCESS_STATE_UNKNOWN",
+        "PROCESS_COMMUNICATION_STDOUT",
+        "PROCESS_COMMUNICATION_STDERR",
         "TICK_5",
         "TICK_60",
         "TICK_3600",
         "SUPERVISOR_STATE_CHANGE_RUNNING",
         "SUPERVISOR_STATE_CHANGE_STOPPING",
+        "REMOTE_COMMUNICATION",
     ];
     KNOWN.iter().copied().find(|k| *k == s).unwrap_or("EVENT")
 }
