@@ -445,6 +445,37 @@ mod tests {
     }
 
     #[test]
+    fn response_round_trips_through_the_parser() {
+        let v = Value::Array(vec![
+            Value::Struct(vec![
+                ("name".into(), Value::Str("web".into())),
+                ("pid".into(), Value::Int(42)),
+                ("ok".into(), Value::Bool(true)),
+            ]),
+            Value::Str("trailing & <special>".into()),
+        ]);
+        let xml = serialize_response(&v);
+        let parsed = parse_method_response(&xml).unwrap();
+        assert_eq!(parsed, v);
+    }
+
+    #[test]
+    fn fault_round_trips_through_the_parser() {
+        let xml = serialize_fault(10, "BAD_NAME: web");
+        let err = parse_method_response(&xml).unwrap_err();
+        assert_eq!(err, (10, "BAD_NAME: web".to_string()));
+    }
+
+    #[test]
+    fn client_call_and_server_parse_are_symmetric() {
+        let params = vec![Value::Str("web".into()), Value::Bool(true), Value::Int(-3)];
+        let xml = serialize_method_call("supervisor.startProcess", &params);
+        let (method, parsed) = parse_method_call(&xml).unwrap();
+        assert_eq!(method, "supervisor.startProcess");
+        assert_eq!(parsed, params);
+    }
+
+    #[test]
     fn escapes_special_characters() {
         let v = Value::Str("a < b & c".into());
         let mut out = String::new();

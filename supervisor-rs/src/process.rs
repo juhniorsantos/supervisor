@@ -83,6 +83,11 @@ pub struct Process {
     subscribed: std::collections::HashSet<String>,
     /// Buffered events awaiting delivery: `(serial, name, payload)`.
     event_buffer: std::collections::VecDeque<(u64, String, String)>,
+    /// An envelope currently being written to a listener's stdin, with how
+    /// many of its bytes have been flushed so far. Lets a large or
+    /// slow-to-drain write resume across ticks without re-sending.
+    pending_write: Vec<u8>,
+    pending_off: usize,
 }
 
 /// The state of an event listener in the notification protocol, mirroring
@@ -177,6 +182,8 @@ impl Process {
             stderr_syslog: stderr_syslog_writer,
             subscribed: config_events.into_iter().collect(),
             event_buffer: std::collections::VecDeque::new(),
+            pending_write: Vec::new(),
+            pending_off: 0,
         }
     }
 
@@ -216,26 +223,51 @@ impl Process {
         self.event_buffer.front().cloned()
     }
 
-    /// Write an event envelope to the listener's stdin and mark it BUSY.
-    /// Returns true if the write succeeded and the event was consumed.
-    pub fn send_event(&mut self, envelope: &[u8]) -> bool {
-        let Some(fd) = self.stdin_write.as_ref() else {
-            return false;
-        };
-        let n = unsafe {
-            libc::write(
-                fd.as_raw_fd(),
-                envelope.as_ptr() as *const libc::c_void,
-                envelope.len(),
-            )
-        };
-        if n == envelope.len() as isize {
-            self.event_buffer.pop_front();
-            self.listener_state = ListenerState::Busy;
-            true
-        } else {
-            false
+    /// Whether there is a partially-written stdin payload still being flushed.
+    pub fn has_pending_write(&self) -> bool {
+        !self.pending_write.is_empty()
+    }
+
+    /// Flush as much of the pending stdin write as the (non-blocking) pipe
+    /// will currently accept. Safe to call repeatedly; a partial write simply
+    /// resumes on the next tick.
+    pub fn pump_stdin(&mut self) {
+        if self.pending_write.is_empty() {
+            return;
         }
+        let Some(fd) = self.stdin_write.as_ref() else {
+            self.pending_write.clear();
+            self.pending_off = 0;
+            return;
+        };
+        let raw = fd.as_raw_fd();
+        while self.pending_off < self.pending_write.len() {
+            let chunk = &self.pending_write[self.pending_off..];
+            let n =
+                unsafe { libc::write(raw, chunk.as_ptr() as *const libc::c_void, chunk.len()) };
+            if n > 0 {
+                self.pending_off += n as usize;
+            } else {
+                // EAGAIN (pipe full) or EPIPE (closed): stop and retry later.
+                break;
+            }
+        }
+        if self.pending_off >= self.pending_write.len() {
+            self.pending_write.clear();
+            self.pending_off = 0;
+        }
+    }
+
+    /// Begin delivering an event envelope to the listener: consume the
+    /// buffered event, mark the listener BUSY, and start flushing. Because the
+    /// listener is now BUSY it won't be handed another event until its RESULT
+    /// arrives, so even a slow/partial write can never interleave two events.
+    pub fn begin_send_event(&mut self, envelope: Vec<u8>) {
+        self.event_buffer.pop_front();
+        self.listener_state = ListenerState::Busy;
+        self.pending_write = envelope;
+        self.pending_off = 0;
+        self.pump_stdin();
     }
 
     /// Write `data` to the process's stdin. Returns the number of bytes
@@ -437,6 +469,8 @@ impl Process {
             self.listener_buf.clear();
             self.result_len = None;
             self.result_buf.clear();
+            self.pending_write.clear();
+            self.pending_off = 0;
         }
     }
 
@@ -460,8 +494,11 @@ impl Process {
         let expected = !signaled && self.config.exitcodes.contains(&es);
         self.last_exit_expected = expected;
         self.laststop_sys = Some(SystemTime::now());
-        // The stdin pipe is gone once the process exits.
+        // The stdin pipe is gone once the process exits; drop any half-written
+        // event envelope with it.
         self.stdin_write = None;
+        self.pending_write.clear();
+        self.pending_off = 0;
 
         match self.state {
             ProcessState::Starting => {
@@ -1216,6 +1253,227 @@ fn fmt_duration(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- State-machine test helpers ---------------------------------------
+    //
+    // These build a Process without ever spawning a child, then drive
+    // on_reap()/transition()/stop() directly. on_reap and transition perform
+    // no fork; the only system call risk is signalling, which we avoid by
+    // leaving pid == 0 (send_signal is a no-op for pid <= 0).
+
+    fn make_proc(extra: &str) -> Process {
+        let text = format!("[program:t]\ncommand=/bin/true\n{extra}");
+        let cfg = crate::config::Config::parse(&text).unwrap();
+        Process::new(cfg.programs[0].clone(), std::path::Path::new("/tmp"))
+    }
+
+    fn make_listener(extra: &str) -> Process {
+        let text = format!("[eventlistener:t]\ncommand=/bin/cat\n{extra}");
+        let cfg = crate::config::Config::parse(&text).unwrap();
+        Process::new(cfg.programs[0].clone(), std::path::Path::new("/tmp"))
+    }
+
+    /// Encode a `waitpid` status for a normal exit with `code`.
+    fn exited(code: i32) -> i32 {
+        (code & 0xff) << 8
+    }
+
+    #[test]
+    fn reap_running_clean_exit_goes_exited() {
+        let mut p = make_proc("autorestart=false");
+        p.state = ProcessState::Running;
+        p.pid = 0;
+        p.laststart = Some(Instant::now());
+        p.on_reap(exited(0), Instant::now());
+        assert_eq!(p.state, ProcessState::Exited);
+        assert_eq!(p.exitstatus, Some(0));
+        assert_eq!(p.pid, 0);
+        assert!(p.last_exit_expected);
+    }
+
+    #[test]
+    fn reap_running_signal_is_unexpected() {
+        let mut p = make_proc("");
+        p.state = ProcessState::Running;
+        p.laststart = Some(Instant::now());
+        p.on_reap(9, Instant::now()); // raw status: killed by signal 9
+        assert_eq!(p.state, ProcessState::Exited);
+        assert_eq!(p.exitstatus, Some(-9));
+        assert!(!p.last_exit_expected);
+    }
+
+    #[test]
+    fn reap_starting_too_quickly_backs_off() {
+        let mut p = make_proc("startsecs=5\nstartretries=3");
+        p.state = ProcessState::Starting;
+        p.laststart = Some(Instant::now()); // just started -> "too quickly"
+        p.backoff = 0;
+        p.on_reap(exited(1), Instant::now());
+        assert_eq!(p.state, ProcessState::Backoff);
+        assert_eq!(p.backoff, 1);
+        assert!(p.delay.is_some());
+        assert!(p.spawnerr.is_some());
+    }
+
+    #[test]
+    fn reap_starting_after_startsecs_exits() {
+        let mut p = make_proc("startsecs=1");
+        p.state = ProcessState::Starting;
+        p.laststart = Some(Instant::now() - Duration::from_secs(5));
+        p.on_reap(exited(0), Instant::now());
+        assert_eq!(p.state, ProcessState::Exited);
+    }
+
+    #[test]
+    fn reap_stopping_goes_stopped() {
+        let mut p = make_proc("");
+        p.state = ProcessState::Stopping;
+        p.on_reap(exited(0), Instant::now());
+        assert_eq!(p.state, ProcessState::Stopped);
+    }
+
+    #[test]
+    fn transition_starting_to_running_emits_event() {
+        let mut p = make_proc("startsecs=0");
+        p.state = ProcessState::Starting;
+        p.laststart = Some(Instant::now() - Duration::from_secs(1));
+        p.pid = 4321;
+        p.pending_events.clear();
+        p.transition(Instant::now(), false);
+        assert_eq!(p.state, ProcessState::Running);
+        let (name, payload) = p.pending_events.last().unwrap();
+        assert_eq!(name, "PROCESS_STATE_RUNNING");
+        assert!(payload.contains("pid:4321"));
+        assert!(payload.contains("from_state:STARTING"));
+    }
+
+    #[test]
+    fn transition_backoff_exceeding_retries_goes_fatal() {
+        let mut p = make_proc("startretries=2");
+        p.state = ProcessState::Backoff;
+        p.backoff = 3; // 3 > 2
+        p.transition(Instant::now(), false);
+        assert_eq!(p.state, ProcessState::Fatal);
+        assert!(p.spawnerr.is_some());
+    }
+
+    #[test]
+    fn backoff_then_stop_cancels_to_stopped() {
+        // Drive the full too-quick-exit -> backoff -> stop path.
+        let mut p = make_proc("startsecs=5");
+        p.state = ProcessState::Starting;
+        p.laststart = Some(Instant::now());
+        p.on_reap(exited(1), Instant::now());
+        assert_eq!(p.state, ProcessState::Backoff);
+        // A stop request while backing off must abandon retries immediately.
+        assert!(p.stop(Instant::now()));
+        assert_eq!(p.state, ProcessState::Stopped);
+    }
+
+    #[test]
+    fn should_restart_honours_autorestart_modes() {
+        let mut never = make_proc("autorestart=false");
+        never.exitstatus = Some(3);
+        assert!(!never.should_restart());
+
+        let mut always = make_proc("autorestart=true");
+        always.exitstatus = Some(0);
+        assert!(always.should_restart());
+
+        let mut unexpected = make_proc("autorestart=unexpected\nexitcodes=0,2");
+        unexpected.exitstatus = Some(0);
+        assert!(!unexpected.should_restart(), "expected code must not restart");
+        unexpected.exitstatus = Some(2);
+        assert!(!unexpected.should_restart(), "listed code must not restart");
+        unexpected.exitstatus = Some(5);
+        assert!(unexpected.should_restart(), "unlisted code restarts");
+        unexpected.exitstatus = Some(-15);
+        assert!(unexpected.should_restart(), "signal death restarts");
+    }
+
+    #[test]
+    fn stop_running_enters_stopping_without_signalling_real_pid() {
+        let mut p = make_proc("");
+        p.state = ProcessState::Running;
+        p.pid = 0; // keep send_signal a no-op so no real process is touched
+        assert!(p.stop(Instant::now()));
+        assert_eq!(p.state, ProcessState::Stopping);
+        assert!(p.administratively_stopped);
+    }
+
+    #[test]
+    fn administratively_stopped_process_is_not_autorestarted() {
+        let mut p = make_proc("autorestart=true");
+        p.state = ProcessState::Running;
+        p.pid = 0;
+        p.stop(Instant::now()); // -> Stopping, administratively_stopped = true
+        p.on_reap(exited(0), Instant::now()); // -> Stopped (not Exited)
+        assert_eq!(p.state, ProcessState::Stopped);
+        // Stopped processes are not respawned by transition (only Exited are).
+        p.transition(Instant::now(), false);
+        assert_eq!(p.state, ProcessState::Stopped);
+    }
+
+    #[test]
+    fn event_buffer_overflows_oldest_first() {
+        let mut p = make_listener("buffer_size=10\nevents=PROCESS_STATE");
+        for serial in 0..12u64 {
+            p.buffer_event(serial, "PROCESS_STATE_RUNNING", "x");
+        }
+        assert_eq!(p.event_buffer.len(), 10);
+        // The two oldest (serials 0 and 1) were discarded.
+        assert_eq!(p.peek_event().unwrap().0, 2);
+    }
+
+    #[test]
+    fn listener_subscription_matching() {
+        let p = make_listener("events=PROCESS_STATE,TICK_60");
+        assert!(p.subscribed_to("PROCESS_STATE_RUNNING"));
+        assert!(p.subscribed_to("TICK_60"));
+        assert!(!p.subscribed_to("TICK_5"));
+        assert!(!p.subscribed_to("PROCESS_COMMUNICATION_STDOUT"));
+    }
+
+    #[test]
+    fn partial_writes_deliver_a_large_envelope_intact() {
+        // Regression test for the partial-write fix: a payload larger than the
+        // pipe buffer must be delivered across several pump_stdin() calls with
+        // no corruption and no re-sending.
+        let (read, write) = make_stdin_pipe().unwrap();
+        // Make the read end non-blocking so draining never deadlocks.
+        unsafe {
+            let fl = libc::fcntl(read.as_raw_fd(), libc::F_GETFL);
+            libc::fcntl(read.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        let mut p = make_listener("events=PROCESS_STATE");
+        p.stdin_write = Some(write);
+
+        let payload = vec![b'x'; 200_000]; // > 64 KiB default pipe buffer
+        p.begin_send_event(payload.clone());
+        assert_eq!(p.listener_state, ListenerState::Busy);
+
+        let mut got = Vec::new();
+        let mut buf = [0u8; 65536];
+        for _ in 0..1000 {
+            p.pump_stdin();
+            loop {
+                let n = unsafe {
+                    libc::read(read.as_raw_fd(), buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                };
+                if n > 0 {
+                    got.extend_from_slice(&buf[..n as usize]);
+                } else {
+                    break;
+                }
+            }
+            if !p.has_pending_write() {
+                break;
+            }
+        }
+        assert!(!p.has_pending_write(), "envelope should be fully flushed");
+        assert_eq!(got.len(), payload.len(), "every byte delivered exactly once");
+        assert!(got.iter().all(|&b| b == b'x'));
+    }
 
     #[test]
     fn splits_quoted_commands() {

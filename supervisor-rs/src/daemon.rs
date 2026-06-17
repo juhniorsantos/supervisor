@@ -289,10 +289,19 @@ impl Supervisor {
         self.buffer_to_listeners(name, payload);
     }
 
-    /// Deliver the oldest buffered event to each ready listener.
+    /// Continue any in-flight envelope writes, then hand the oldest buffered
+    /// event to each ready listener.
     fn dispatch_to_listeners(&mut self) {
         let identifier = self.config.supervisord.identifier.clone();
         for p in &mut self.processes {
+            if !p.is_listener() {
+                continue;
+            }
+            // Finish flushing a previous (partial) envelope before sending more.
+            if p.has_pending_write() {
+                p.pump_stdin();
+                continue;
+            }
             if !p.listener_ready() {
                 continue;
             }
@@ -305,7 +314,7 @@ impl Supervisor {
                     pool = p.pool_name(),
                     len = payload.len(),
                 );
-                p.send_event(envelope.as_bytes());
+                p.begin_send_event(envelope.into_bytes());
             }
         }
     }
@@ -852,4 +861,221 @@ fn now_timestamp() -> String {
         tm.tm_min,
         tm.tm_sec
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::xmlrpc::Value;
+
+    /// A unique temp directory for a test (cleaned up at the end).
+    fn temp_dir(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("suprs-{}-{}", std::process::id(), tag));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn cfg_text(dir: &std::path::Path, programs: &str) -> String {
+        let d = dir.display();
+        format!(
+            "[unix_http_server]\nfile={d}/s.sock\n\
+             [supervisord]\nlogfile={d}/sd.log\nchildlogdir={d}\npidfile={d}/sd.pid\n\
+             {programs}"
+        )
+    }
+
+    fn build(dir: &std::path::Path, programs: &str) -> Supervisor {
+        let cfg = Config::parse(&cfg_text(dir, programs)).unwrap();
+        Supervisor::new(cfg).unwrap()
+    }
+
+    /// Look up a struct field in an XML-RPC value.
+    fn field<'a>(v: &'a Value, key: &str) -> Option<&'a Value> {
+        if let Value::Struct(members) = v {
+            members.iter().find(|(k, _)| k == key).map(|(_, val)| val)
+        } else {
+            None
+        }
+    }
+
+    fn call(sup: &mut Supervisor, method: &str, params: &[Value]) -> Result<Value, (i32, String)> {
+        rpc::dispatch(sup, method, params, Instant::now())
+    }
+
+    #[test]
+    fn rpc_basic_introspection() {
+        let dir = temp_dir("introspect");
+        let mut sup = build(&dir, "[program:web]\ncommand=/bin/true\nautostart=false\n");
+
+        assert_eq!(
+            call(&mut sup, "supervisor.getAPIVersion", &[]).unwrap(),
+            Value::Str("3.0".into())
+        );
+        let state = call(&mut sup, "supervisor.getState", &[]).unwrap();
+        assert_eq!(field(&state, "statename"), Some(&Value::Str("RUNNING".into())));
+        assert_eq!(
+            call(&mut sup, "supervisor.getPID", &[]).unwrap(),
+            Value::Int(std::process::id() as i64)
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rpc_process_info_and_faults() {
+        let dir = temp_dir("info");
+        let mut sup = build(&dir, "[program:web]\ncommand=/bin/true\nautostart=false\n");
+
+        let all = call(&mut sup, "supervisor.getAllProcessInfo", &[]).unwrap();
+        match all {
+            Value::Array(items) => {
+                assert_eq!(items.len(), 1);
+                assert_eq!(field(&items[0], "name"), Some(&Value::Str("web".into())));
+                // Not started yet -> STOPPED (state code 0).
+                assert_eq!(field(&items[0], "state"), Some(&Value::Int(0)));
+            }
+            other => panic!("expected array, got {other:?}"),
+        }
+
+        // Unknown process name -> BAD_NAME fault.
+        let err = call(&mut sup, "supervisor.getProcessInfo", &[Value::Str("nope".into())]);
+        assert_eq!(err.unwrap_err().0, rpc::faults::BAD_NAME);
+
+        // Unknown method -> UNKNOWN_METHOD fault.
+        let err = call(&mut sup, "supervisor.bogusMethod", &[]);
+        assert_eq!(err.unwrap_err().0, rpc::faults::UNKNOWN_METHOD);
+
+        // Stopping a process that isn't running -> NOT_RUNNING.
+        let err = call(&mut sup, "supervisor.stopProcess", &[Value::Str("web".into())]);
+        assert_eq!(err.unwrap_err().0, rpc::faults::NOT_RUNNING);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn signal_and_stdin_faults_on_stopped_process() {
+        let dir = temp_dir("signal");
+        let mut sup = build(&dir, "[program:web]\ncommand=/bin/true\nautostart=false\n");
+
+        // A stopped process is not signallable / writable.
+        assert_eq!(
+            sup.op_signal("web", libc::SIGHUP).unwrap_err().0,
+            rpc::faults::NOT_RUNNING
+        );
+        assert_eq!(
+            sup.op_send_stdin("web", "hi\n").unwrap_err().0,
+            rpc::faults::NOT_RUNNING
+        );
+        // Bad signal name is rejected before reaching a process.
+        let err = call(
+            &mut sup,
+            "supervisor.signalProcess",
+            &[Value::Str("web".into()), Value::Str("NOTASIGNAL".into())],
+        );
+        assert_eq!(err.unwrap_err().0, rpc::faults::BAD_SIGNAL);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn groups_are_reported_in_process_info() {
+        let dir = temp_dir("groups");
+        let sup = build(
+            &dir,
+            "[program:a]\ncommand=/bin/true\nautostart=false\n\
+             [program:b]\ncommand=/bin/true\nautostart=false\n\
+             [group:grp]\nprograms=a,b\n",
+        );
+        let info = sup.process_info("a").unwrap();
+        assert_eq!(info.group, "grp");
+        // The group:name namespec resolves to the same process.
+        assert_eq!(sup.process_info("grp:a").unwrap().name, "a");
+        assert!(sup.has_group("grp"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_config_detects_added_changed_removed() {
+        let dir = temp_dir("reload");
+        let conf_path = dir.join("supervisord.conf");
+
+        std::fs::write(
+            &conf_path,
+            cfg_text(&dir, "[program:keep]\ncommand=/bin/true\nautostart=false\n\
+                            [program:gone]\ncommand=/bin/true\nautostart=false\n"),
+        )
+        .unwrap();
+        let cfg = Config::load(&conf_path).unwrap();
+        let mut sup = Supervisor::new(cfg).unwrap();
+
+        // Rewrite the file: drop `gone`, change `keep`'s command, add `fresh`.
+        std::fs::write(
+            &conf_path,
+            cfg_text(&dir, "[program:keep]\ncommand=/bin/false\nautostart=false\n\
+                            [program:fresh]\ncommand=/bin/true\nautostart=false\n"),
+        )
+        .unwrap();
+
+        let (added, changed, removed) = sup.reload_config().unwrap();
+        assert_eq!(added, vec!["fresh".to_string()]);
+        assert_eq!(changed, vec!["keep".to_string()]);
+        assert_eq!(removed, vec!["gone".to_string()]);
+
+        // Apply: add the new group, then it must exist and be removable.
+        sup.add_process_group("fresh", Instant::now()).unwrap();
+        assert!(sup.has_group("fresh"));
+        // Adding twice -> ALREADY_ADDED.
+        assert_eq!(
+            sup.add_process_group("fresh", Instant::now()).unwrap_err().0,
+            rpc::faults::ALREADY_ADDED
+        );
+        // It is stopped (autostart=false), so removal succeeds.
+        sup.remove_process_group("fresh").unwrap();
+        assert!(!sup.has_group("fresh"));
+        // Removing an unknown group -> BAD_NAME.
+        assert_eq!(
+            sup.remove_process_group("nope").unwrap_err().0,
+            rpc::faults::BAD_NAME
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reload_with_no_changes_reports_nothing() {
+        let dir = temp_dir("reload-noop");
+        let conf_path = dir.join("supervisord.conf");
+        let body = cfg_text(
+            &dir,
+            "[program:a]\ncommand=/bin/true\nnumprocs=2\nprocess_name=%(program_name)s_%(process_num)02d\nautostart=false\n\
+             [group:g]\nprograms=a\n",
+        );
+        std::fs::write(&conf_path, &body).unwrap();
+        let cfg = Config::load(&conf_path).unwrap();
+        let mut sup = Supervisor::new(cfg).unwrap();
+
+        // Re-reading the identical file must not flag any group as changed,
+        // which would otherwise make `update` needlessly restart processes.
+        let (added, changed, removed) = sup.reload_config().unwrap();
+        assert!(added.is_empty(), "unexpected added: {added:?}");
+        assert!(changed.is_empty(), "unexpected changed: {changed:?}");
+        assert!(removed.is_empty(), "unexpected removed: {removed:?}");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn clear_main_log_truncates() {
+        let dir = temp_dir("clearlog");
+        let mut sup = build(&dir, "");
+        sup.log_line("INFO", "some noise to make the log non-empty");
+        let logfile = dir.join("sd.log");
+        assert!(std::fs::metadata(&logfile).unwrap().len() > 0);
+        sup.clear_main_log().unwrap();
+        assert_eq!(std::fs::metadata(&logfile).unwrap().len(), 0);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
