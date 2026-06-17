@@ -61,6 +61,12 @@ pub struct ProgramConfig {
     pub exitcodes: Vec<i32>,
     pub stopsignal: i32,
     pub stopwaitsecs: u64,
+    /// Send the stop signal to the whole process group (default true), so a
+    /// program's forked children stop with it.
+    pub stopasgroup: bool,
+    /// Send SIGKILL to the whole process group on escalation (default:
+    /// follows `stopasgroup`).
+    pub killasgroup: bool,
     pub environment: Vec<(String, String)>,
     pub user: Option<String>,
     pub umask: Option<u32>,
@@ -736,6 +742,10 @@ fn parse_program(
     };
     let stopsignal = m.get("stopsignal").map(|v| parse_signal(v)).transpose()?.unwrap_or(libc::SIGTERM);
     let stopwaitsecs = m.get("stopwaitsecs").map(|v| v.parse()).transpose().map_err(|_| "invalid stopwaitsecs")?.unwrap_or(10);
+    // Default to signalling the whole process group; killasgroup follows
+    // stopasgroup unless set explicitly.
+    let stopasgroup = m.get("stopasgroup").map(|v| parse_bool(v)).transpose()?.unwrap_or(true);
+    let killasgroup = m.get("killasgroup").map(|v| parse_bool(v)).transpose()?.unwrap_or(stopasgroup);
     let user = m.get("user").map(|s| s.to_string());
     let umask = match m.get("umask") {
         None => None,
@@ -801,6 +811,8 @@ fn parse_program(
             exitcodes: exitcodes.clone(),
             stopsignal,
             stopwaitsecs,
+            stopasgroup,
+            killasgroup,
             environment: environment.clone(),
             user: user.clone(),
             umask,
@@ -930,6 +942,28 @@ buffer_size=20
         assert_eq!(l.buffer_size, 20);
         assert_eq!(l.events, vec!["PROCESS_STATE".to_string(), "TICK_60".to_string()]);
         assert_eq!(l.priority, -1); // listeners start first by default
+    }
+
+    #[test]
+    fn stopasgroup_defaults_true_killasgroup_follows() {
+        // Default: both true (stop a program's whole process tree).
+        let cfg = Config::parse("[program:p]\ncommand=/bin/true\n").unwrap();
+        assert!(cfg.programs[0].stopasgroup);
+        assert!(cfg.programs[0].killasgroup);
+
+        // Opting out of stopasgroup also opts killasgroup out (it follows).
+        let cfg =
+            Config::parse("[program:p]\ncommand=/bin/true\nstopasgroup=false\n").unwrap();
+        assert!(!cfg.programs[0].stopasgroup);
+        assert!(!cfg.programs[0].killasgroup);
+
+        // killasgroup can still be set independently.
+        let cfg = Config::parse(
+            "[program:p]\ncommand=/bin/true\nstopasgroup=false\nkillasgroup=true\n",
+        )
+        .unwrap();
+        assert!(!cfg.programs[0].stopasgroup);
+        assert!(cfg.programs[0].killasgroup);
     }
 
     #[test]

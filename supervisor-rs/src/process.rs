@@ -313,7 +313,8 @@ impl Process {
         ) {
             return false;
         }
-        self.send_signal(sig);
+        // A manual signal goes to the main process only (matching upstream).
+        self.send_signal(sig, false);
         true
     }
 
@@ -616,7 +617,7 @@ impl Process {
                 if let Some(d) = self.delay {
                     if now >= d && self.pid != 0 {
                         // stopwaitsecs elapsed; escalate to SIGKILL.
-                        self.send_signal(libc::SIGKILL);
+                        self.send_signal(libc::SIGKILL, self.config.killasgroup);
                         self.delay = Some(now + Duration::from_secs(2));
                     }
                 }
@@ -666,7 +667,7 @@ impl Process {
         self.administratively_stopped = true;
         match self.state {
             ProcessState::Running | ProcessState::Starting => {
-                self.send_signal(self.config.stopsignal);
+                self.send_signal(self.config.stopsignal, self.config.stopasgroup);
                 self.delay = Some(now + Duration::from_secs(self.config.stopwaitsecs));
                 self.change_state(ProcessState::Stopping);
                 true
@@ -695,15 +696,16 @@ impl Process {
         }
     }
 
-    fn send_signal(&self, sig: i32) {
+    fn send_signal(&self, sig: i32, as_group: bool) {
         if self.pid <= 0 {
             return;
         }
-        // Signal the whole process group (the child called setsid, so its
-        // pgid equals its pid). Fall back to the bare pid if the group is
-        // gone.
+        // When `as_group`, signal the whole process group (the child called
+        // setsid, so its pgid equals its pid), falling back to the bare pid if
+        // the group is already gone; otherwise signal just the main process.
         unsafe {
-            if libc::kill(-self.pid, sig) != 0 {
+            let target = if as_group { -self.pid } else { self.pid };
+            if libc::kill(target, sig) != 0 && as_group {
                 libc::kill(self.pid, sig);
             }
         }

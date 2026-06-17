@@ -123,8 +123,10 @@ config's directory).
 
 `[program:x]`: `command`, `process_name`, `numprocs`, `directory`,
 `autostart`, `autorestart` (`true`/`false`/`unexpected`), `startsecs`,
-`startretries`, `exitcodes`, `stopsignal`, `stopwaitsecs`, `environment`,
-`user`, `umask`, `priority`, `redirect_stderr`, `stdout_logfile`(+`_maxbytes`,
+`startretries`, `exitcodes`, `stopsignal`, `stopwaitsecs`, `stopasgroup`,
+`killasgroup` (both default true — stop a program's whole process tree),
+`environment`, `user`, `umask`, `priority`, `redirect_stderr`,
+`stdout_logfile`(+`_maxbytes`,
 `_backups`, `_capture_maxbytes`, `_syslog`), `stderr_logfile`(+`_maxbytes`,
 `_backups`, `_capture_maxbytes`, `_syslog`).
 
@@ -181,9 +183,10 @@ Implemented (the MVP you asked for):
 
 Not yet ported (smaller remaining options):
 
-- [ ] `stopasgroup`/`killasgroup` (this build always signals the child's
-      process group), `numprocs_start`, per-program `serverurl`
+- [ ] `numprocs_start`, per-program `serverurl`, `*_events_enabled`
+- [ ] `loglevel` filtering, `minfds`/`minprocs`, supervisord `user`/`nocleanup`
 - [ ] `%(here)s`/`%(ENV_x)s` expansions in arbitrary option values
+- [ ] `getAllConfigInfo` / `system.*` RPC, `[rpcinterface:x]` plugins
 
 ## Tests
 
