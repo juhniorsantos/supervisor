@@ -34,7 +34,7 @@ pub enum AutoRestart {
 }
 
 /// Where a process's stdout/stderr stream should be written.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LogTarget {
     /// Resolve to `<childlogdir>/<name>-<stream>.log` automatically.
     Auto,
@@ -45,7 +45,7 @@ pub enum LogTarget {
 }
 
 /// Configuration for a single supervised program instance.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ProgramConfig {
     pub name: String,
     /// The base program/eventlistener section name (before numprocs expansion).
@@ -143,6 +143,8 @@ pub struct Config {
     pub inet_addr: Option<String>,
     /// Basic-auth credentials for the inet server, if configured.
     pub inet_auth: HttpAuth,
+    /// The path this config was loaded from (for `reread`/`reloadConfig`).
+    pub path: Option<PathBuf>,
 }
 
 fn default_tmpdir() -> PathBuf {
@@ -368,16 +370,47 @@ fn expand_process_name(template: &str, program_name: &str, process_num: usize) -
 }
 
 impl Config {
-    /// Load and parse a configuration file from `path`.
+    /// Load and parse a configuration file from `path`, expanding any
+    /// `[include] files=` globs (relative to the config file's directory).
     pub fn load(path: &std::path::Path) -> Result<Config, String> {
         let text = std::fs::read_to_string(path)
             .map_err(|e| format!("cannot read config {}: {e}", path.display()))?;
-        Config::parse(&text)
+        let mut sections = parse_ini(&text)?;
+
+        // Process [include] files=, in the directory of the main config.
+        let base_dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+        let include_globs: Vec<String> = sections
+            .iter()
+            .filter(|s| s.name == "include")
+            .flat_map(|s| {
+                items_map(&s.items)
+                    .get("files")
+                    .map(|v| {
+                        v.split_whitespace().map(|s| s.to_string()).collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default()
+            })
+            .collect();
+        for pattern in include_globs {
+            for file in expand_glob(base_dir, &pattern) {
+                let itext = std::fs::read_to_string(&file)
+                    .map_err(|e| format!("cannot read included config {}: {e}", file.display()))?;
+                sections.extend(parse_ini(&itext)?);
+            }
+        }
+
+        let mut config = Config::build(sections)?;
+        config.path = Some(path.to_path_buf());
+        Ok(config)
     }
 
-    /// Parse configuration from a string.
+    /// Parse configuration from a single string (no `[include]` expansion).
     pub fn parse(text: &str) -> Result<Config, String> {
-        let sections = parse_ini(text)?;
+        Config::build(parse_ini(text)?)
+    }
+
+    /// Build a [`Config`] from already-tokenised sections.
+    fn build(sections: Vec<Section>) -> Result<Config, String> {
         let mut supervisord = SupervisordConfig::default();
         let mut socket_path = None;
         let mut unix_auth = HttpAuth::default();
@@ -466,8 +499,73 @@ impl Config {
             unix_auth,
             inet_addr,
             inet_auth,
+            path: None,
         })
     }
+}
+
+/// Expand a (possibly wildcard) include pattern against `base_dir`. Supports
+/// `*` and `?` in the final path component, which covers the common
+/// `conf.d/*.conf` case. Results are sorted for determinism.
+fn expand_glob(base_dir: &std::path::Path, pattern: &str) -> Vec<PathBuf> {
+    let joined = if std::path::Path::new(pattern).is_absolute() {
+        PathBuf::from(pattern)
+    } else {
+        base_dir.join(pattern)
+    };
+
+    let parent = joined.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let file_pat = joined
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_default();
+
+    if !file_pat.contains('*') && !file_pat.contains('?') {
+        // No wildcard: a plain file path.
+        return if joined.exists() { vec![joined] } else { Vec::new() };
+    }
+
+    let mut matches = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(parent) {
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if glob_match(&file_pat, &name) {
+                matches.push(entry.path());
+            }
+        }
+    }
+    matches.sort();
+    matches
+}
+
+/// Match a filename against a simple glob with `*` (any run) and `?` (one
+/// char). No `[...]` classes — kept intentionally small.
+fn glob_match(pattern: &str, name: &str) -> bool {
+    let p: Vec<char> = pattern.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    // Classic two-pointer wildcard match with backtracking on `*`.
+    let (mut pi, mut ni) = (0usize, 0usize);
+    let (mut star, mut mark) = (None, 0usize);
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ni;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ni = mark;
+        } else {
+            return false;
+        }
+    }
+    while pi < p.len() && p[pi] == '*' {
+        pi += 1;
+    }
+    pi == p.len()
 }
 
 /// Normalise an `[inet_http_server] port=` value into a `host:port` string
@@ -723,6 +821,51 @@ process_name=%(program_name)s_%(process_num)02d
         assert_eq!(cfg.programs[0].name, "web_00");
         assert_eq!(cfg.programs[1].name, "web_01");
         assert_eq!(cfg.programs[0].autorestart, AutoRestart::Unexpected);
+    }
+
+    #[test]
+    fn glob_matches_wildcards() {
+        assert!(glob_match("*.conf", "web.conf"));
+        assert!(glob_match("*.conf", ".conf"));
+        assert!(!glob_match("*.conf", "web.cfg"));
+        assert!(glob_match("conf-?.ini", "conf-1.ini"));
+        assert!(!glob_match("conf-?.ini", "conf-12.ini"));
+        assert!(glob_match("a*b*c", "axxbxxc"));
+    }
+
+    #[test]
+    fn group_section_assigns_membership() {
+        let text = "\
+[program:a]
+command=/bin/true
+[program:b]
+command=/bin/true
+[group:grp]
+programs=a,b
+priority=5
+";
+        let cfg = Config::parse(text).unwrap();
+        for p in &cfg.programs {
+            assert_eq!(p.group, "grp");
+            assert_eq!(p.priority, 5);
+        }
+    }
+
+    #[test]
+    fn eventlistener_section_is_parsed() {
+        let text = "\
+[eventlistener:l]
+command=/bin/cat
+events=PROCESS_STATE,TICK_60
+buffer_size=20
+";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.programs.len(), 1);
+        let l = &cfg.programs[0];
+        assert!(l.is_listener);
+        assert_eq!(l.buffer_size, 20);
+        assert_eq!(l.events, vec!["PROCESS_STATE".to_string(), "TICK_60".to_string()]);
+        assert_eq!(l.priority, -1); // listeners start first by default
     }
 
     #[test]

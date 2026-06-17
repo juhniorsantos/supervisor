@@ -104,6 +104,14 @@ Basic auth (`username=`/`password=`) is enforced when configured.
 `[inet_http_server]`: `port` (`ip:port`, or `*:port` for all interfaces),
 `username`, `password`.
 
+`[group:x]`: `programs` (comma-separated program names), `priority`.
+
+`[eventlistener:x]`: like `[program:x]`, plus `events` (subscribed event
+types) and `buffer_size`.
+
+`[include]`: `files` (whitespace-separated paths/globs, relative to the main
+config's directory).
+
 `[program:x]`: `command`, `process_name`, `numprocs`, `directory`,
 `autostart`, `autorestart` (`true`/`false`/`unexpected`), `startsecs`,
 `startretries`, `exitcodes`, `stopsignal`, `stopwaitsecs`, `environment`,
@@ -115,6 +123,7 @@ Basic auth (`username=`/`password=`) is enforced when configured.
 ```
 status [name|all]    start <name|all>    stop <name|all>
 restart <name|all>   tail <name> [stderr]
+reread               update [group|all]  add <group>   remove <group>
 pid [name]           version             reload (restart supervisord)
 shutdown             help
 ```
@@ -143,11 +152,15 @@ Implemented (the MVP you asked for):
       `PROCESS_STATE_*`, `TICK_5/60/3600` and `SUPERVISOR_STATE_CHANGE_*`
       events with upstream-compatible envelopes (works with real listener
       scripts), `events=` subscriptions and `buffer_size`
+- [x] **Dynamic config**: `[include] files=` globs, and
+      `reread`/`update`/`add`/`remove` (`reloadConfig`, `addProcessGroup`,
+      `removeProcessGroup` RPC) to add/remove/restart groups without a full
+      restart
 
 Not yet ported (natural next phases):
 
-- [ ] `supervisorctl fg`, log capture mode, `reread`/`update`/`add`/`remove`
-- [ ] Syslog output, config `[include]` files
+- [ ] `supervisorctl fg`, log capture mode (`PROCESS_COMMUNICATION` events)
+- [ ] Syslog output
 - [ ] Additional RPC methods (`signalProcess`, `clearLog`, `sendProcessStdin`, …)
 
 ## Tests

@@ -86,6 +86,10 @@ fn run_command(socket: &Path, argv: &[String]) {
         "stop" => cmd_stop(socket, args),
         "restart" => cmd_restart(socket, args),
         "pid" => cmd_pid(socket, args),
+        "reread" => cmd_reread(socket),
+        "update" => cmd_update(socket, args),
+        "add" => cmd_add(socket, args),
+        "remove" => cmd_remove(socket, args),
         "version" => match call(socket, "supervisor.getSupervisorVersion", &[]) {
             Ok(v) => println!("{}", as_str(&v)),
             Err(e) => fail_call(socket, e),
@@ -234,6 +238,121 @@ fn cmd_tail(socket: &Path, args: &[String]) {
         Ok(v) => print!("{}", as_str(&v)),
         Err(ClientError::Fault(_, _)) => println!("{name}: ERROR (no log file)"),
         Err(e) => fail_call(socket, e),
+    }
+}
+
+fn cmd_reread(socket: &Path) {
+    match reload_config(socket) {
+        Ok((added, changed, removed)) => {
+            let mut any = false;
+            for (list, label) in [
+                (&added, "available"),
+                (&changed, "changed"),
+                (&removed, "disappeared"),
+            ] {
+                for name in list {
+                    println!("{name}: {label}");
+                    any = true;
+                }
+            }
+            if !any {
+                println!("No config updates to processes");
+            }
+        }
+        Err(e) => fail_call(socket, e),
+    }
+}
+
+fn cmd_update(socket: &Path, args: &[String]) {
+    let (added, changed, removed) = match reload_config(socket) {
+        Ok(t) => t,
+        Err(e) => return fail_call(socket, e),
+    };
+    let filter: Vec<&String> = args.iter().filter(|a| a.as_str() != "all").collect();
+    let wanted = |g: &str| filter.is_empty() || filter.iter().any(|f| f.as_str() == g);
+
+    for gname in &removed {
+        if !wanted(gname) {
+            continue;
+        }
+        let _ = call(socket, "supervisor.stopProcessGroup", &[Value::Str(gname.clone())]);
+        println!("{gname}: stopped");
+        match call(socket, "supervisor.removeProcessGroup", &[Value::Str(gname.clone())]) {
+            Ok(_) => println!("{gname}: removed process group"),
+            Err(ClientError::Fault(_, _)) => println!("{gname}: has problems; not removing"),
+            Err(e) => return fail_call(socket, e),
+        }
+    }
+    for gname in &changed {
+        if !wanted(gname) {
+            continue;
+        }
+        let _ = call(socket, "supervisor.stopProcessGroup", &[Value::Str(gname.clone())]);
+        println!("{gname}: stopped");
+        let _ = call(socket, "supervisor.removeProcessGroup", &[Value::Str(gname.clone())]);
+        let _ = call(socket, "supervisor.addProcessGroup", &[Value::Str(gname.clone())]);
+        println!("{gname}: updated process group");
+    }
+    for gname in &added {
+        if !wanted(gname) {
+            continue;
+        }
+        match call(socket, "supervisor.addProcessGroup", &[Value::Str(gname.clone())]) {
+            Ok(_) => println!("{gname}: added process group"),
+            Err(e) => return fail_call(socket, e),
+        }
+    }
+}
+
+fn cmd_add(socket: &Path, args: &[String]) {
+    for name in args {
+        match call(socket, "supervisor.addProcessGroup", &[Value::Str(name.clone())]) {
+            Ok(_) => println!("{name}: added process group"),
+            Err(ClientError::Fault(90, _)) => println!("ERROR: process group already active"),
+            Err(ClientError::Fault(10, _)) => println!("ERROR: no such process/group: {name}"),
+            Err(e) => return fail_call(socket, e),
+        }
+    }
+}
+
+fn cmd_remove(socket: &Path, args: &[String]) {
+    for name in args {
+        match call(socket, "supervisor.removeProcessGroup", &[Value::Str(name.clone())]) {
+            Ok(_) => println!("{name}: removed process group"),
+            Err(ClientError::Fault(91, _)) => {
+                println!("ERROR: process/group still running: {name}")
+            }
+            Err(ClientError::Fault(10, _)) => println!("ERROR: no such process/group: {name}"),
+            Err(e) => return fail_call(socket, e),
+        }
+    }
+}
+
+/// Group names `(added, changed, removed)` reported by a config reread.
+type ConfigDiff = (Vec<String>, Vec<String>, Vec<String>);
+
+/// Call `reloadConfig` and unpack the `[[added, changed, removed]]` result.
+fn reload_config(socket: &Path) -> Result<ConfigDiff, ClientError> {
+    let result = call(socket, "supervisor.reloadConfig", &[])?;
+    let outer = match &result {
+        Value::Array(items) => items.first(),
+        _ => None,
+    };
+    let triple = match outer {
+        Some(Value::Array(t)) if t.len() == 3 => t,
+        _ => return Err(ClientError::Protocol("malformed reloadConfig result".into())),
+    };
+    Ok((
+        str_list(&triple[0]),
+        str_list(&triple[1]),
+        str_list(&triple[2]),
+    ))
+}
+
+fn str_list(v: &Value) -> Vec<String> {
+    match v {
+        Value::Array(items) => items.iter().map(as_str).collect(),
+        _ => Vec::new(),
     }
 }
 
@@ -388,6 +507,10 @@ fn print_usage() {
          \x20 stop   <name|all>      stop process(es)\n\
          \x20 restart <name|all>     restart process(es)\n\
          \x20 tail   <name> [stderr] show a process log\n\
+         \x20 reread                 re-read config, report changes\n\
+         \x20 update [group|all]     apply config changes (add/remove/restart groups)\n\
+         \x20 add    <group>         activate a group from the config\n\
+         \x20 remove <group>         deactivate a stopped group\n\
          \x20 pid    [name]          supervisord pid, or a process pid\n\
          \x20 version                supervisord version\n\
          \x20 reload                 restart supervisord\n\

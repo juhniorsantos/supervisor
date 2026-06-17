@@ -20,6 +20,9 @@ use crate::process::{Process, ProcessInfo};
 use crate::states::SupervisorState;
 use crate::{rpc, web};
 
+/// Group names that were `(added, changed, removed)` by a config reread.
+pub type ConfigDiff = (Vec<String>, Vec<String>, Vec<String>);
+
 /// Set from the SIGTERM/SIGINT handler, or the `shutdown` RPC, to request a
 /// clean shutdown.
 static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
@@ -52,6 +55,12 @@ pub struct Supervisor {
     event_serial: u64,
     /// Last emitted tick "slice" for each tick period (epoch-aligned).
     last_tick: [i64; 3],
+    /// Path of the loaded config, for `reloadConfig`.
+    config_path: Option<PathBuf>,
+    /// Group configs known from the most recent (re)read, by group name.
+    available_configs: HashMap<String, Vec<crate::config::ProgramConfig>>,
+    /// Group configs currently instantiated as live processes.
+    active_group_configs: HashMap<String, Vec<crate::config::ProgramConfig>>,
 }
 
 impl Supervisor {
@@ -98,6 +107,9 @@ impl Supervisor {
             .map(|pc| Process::new(pc, &childlogdir))
             .collect();
 
+        let grouped = group_configs(&config.programs);
+        let config_path = config.path.clone();
+
         Ok(Supervisor {
             config,
             processes,
@@ -108,6 +120,9 @@ impl Supervisor {
             inet_listener,
             event_serial: 0,
             last_tick: [0; 3],
+            config_path,
+            available_configs: grouped.clone(),
+            active_group_configs: grouped,
         })
     }
 
@@ -498,6 +513,128 @@ impl Supervisor {
         out
     }
 
+    /// Start every process in a group; mirrors `startProcessGroup`.
+    pub fn op_start_group(&mut self, group: &str, now: Instant) -> Vec<(String, String, i32, String)> {
+        let names: Vec<String> = self
+            .processes
+            .iter()
+            .filter(|p| p.config.group == group)
+            .map(|p| p.name().to_string())
+            .collect();
+        let mut out = Vec::new();
+        for name in names {
+            let (code, desc) = match self.op_start(&name, now) {
+                Ok(()) => (rpc::faults::SUCCESS, "started".to_string()),
+                Err((c, _)) => (c, fault_message(c)),
+            };
+            out.push((name, group.to_string(), code, desc));
+        }
+        out
+    }
+
+    /// Stop every process in a group; mirrors `stopProcessGroup`.
+    pub fn op_stop_group(&mut self, group: &str, now: Instant) -> Vec<(String, String, i32, String)> {
+        let names: Vec<String> = self
+            .processes
+            .iter()
+            .filter(|p| p.config.group == group)
+            .map(|p| p.name().to_string())
+            .collect();
+        let mut out = Vec::new();
+        for name in names {
+            let (code, desc) = match self.op_stop(&name, now) {
+                Ok(()) => (rpc::faults::SUCCESS, "stopped".to_string()),
+                Err((c, _)) => (c, fault_message(c)),
+            };
+            out.push((name, group.to_string(), code, desc));
+        }
+        out
+    }
+
+    /// Whether `group` is a currently-active process group.
+    pub fn has_group(&self, group: &str) -> bool {
+        self.active_group_configs.contains_key(group)
+    }
+
+    /// Re-read the configuration file and report `(added, changed, removed)`
+    /// group names relative to the active set. Does not apply the changes;
+    /// `add_process_group`/`remove_process_group` do that.
+    pub fn reload_config(&mut self) -> Result<ConfigDiff, (i32, String)> {
+        let path = self
+            .config_path
+            .clone()
+            .ok_or((rpc::faults::CANT_REREAD, "no config file path".to_string()))?;
+        let new_config = Config::load(&path).map_err(|e| (rpc::faults::CANT_REREAD, e))?;
+        let new_groups = group_configs(&new_config.programs);
+
+        let mut added = Vec::new();
+        let mut changed = Vec::new();
+        let mut removed = Vec::new();
+        for (name, cfgs) in &new_groups {
+            match self.active_group_configs.get(name) {
+                None => added.push(name.clone()),
+                Some(active) if active != cfgs => changed.push(name.clone()),
+                Some(_) => {}
+            }
+        }
+        for name in self.active_group_configs.keys() {
+            if !new_groups.contains_key(name) {
+                removed.push(name.clone());
+            }
+        }
+        added.sort();
+        changed.sort();
+        removed.sort();
+
+        // The newly-read groups become available for add/update.
+        self.available_configs = new_groups;
+        Ok((added, changed, removed))
+    }
+
+    /// Instantiate and activate the group `name` from the last reread config.
+    pub fn add_process_group(&mut self, name: &str, now: Instant) -> Result<(), (i32, String)> {
+        if self.active_group_configs.contains_key(name) {
+            return Err((rpc::faults::ALREADY_ADDED, name.to_string()));
+        }
+        let cfgs = self
+            .available_configs
+            .get(name)
+            .cloned()
+            .ok_or((rpc::faults::BAD_NAME, name.to_string()))?;
+
+        let childlogdir = self.config.supervisord.childlogdir.clone();
+        for cfg in &cfgs {
+            let mut proc = Process::new(cfg.clone(), &childlogdir);
+            if cfg.autostart {
+                proc.start(now);
+            }
+            self.processes.push(proc);
+        }
+        self.active_group_configs.insert(name.to_string(), cfgs);
+        self.resync_pid_index();
+        self.log_line("INFO", &format!("added process group '{name}'"));
+        Ok(())
+    }
+
+    /// Remove the group `name`; fails if any of its processes are running.
+    pub fn remove_process_group(&mut self, name: &str) -> Result<(), (i32, String)> {
+        if !self.active_group_configs.contains_key(name) {
+            return Err((rpc::faults::BAD_NAME, name.to_string()));
+        }
+        let still_running = self
+            .processes
+            .iter()
+            .any(|p| p.config.group == name && (p.pid != 0 || !p.state.is_stopped()));
+        if still_running {
+            return Err((rpc::faults::STILL_RUNNING, name.to_string()));
+        }
+        self.processes.retain(|p| p.config.group != name);
+        self.active_group_configs.remove(name);
+        self.resync_pid_index();
+        self.log_line("INFO", &format!("removed process group '{name}'"));
+        Ok(())
+    }
+
     /// Read up to `length` bytes from a process log starting at `offset`.
     /// `channel` is "stdout" or "stderr". Negative offsets are unsupported.
     pub fn read_log(
@@ -565,6 +702,18 @@ impl Supervisor {
             self.log_line("ERRO", &format!("re-exec failed: {err}"));
         }
     }
+}
+
+/// Group a flat list of program configs by their group name, preserving
+/// each group's program order.
+fn group_configs(
+    programs: &[crate::config::ProgramConfig],
+) -> HashMap<String, Vec<crate::config::ProgramConfig>> {
+    let mut map: HashMap<String, Vec<crate::config::ProgramConfig>> = HashMap::new();
+    for p in programs {
+        map.entry(p.group.clone()).or_default().push(p.clone());
+    }
+    map
 }
 
 /// Map a fault code to the short message the web UI shows.

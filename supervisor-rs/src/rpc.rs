@@ -23,6 +23,9 @@ pub mod faults {
     pub const ALREADY_STARTED: i32 = 60;
     pub const NOT_RUNNING: i32 = 70;
     pub const SUCCESS: i32 = 80;
+    pub const ALREADY_ADDED: i32 = 90;
+    pub const STILL_RUNNING: i32 = 91;
+    pub const CANT_REREAD: i32 = 92;
 }
 
 /// Dispatch a single XML-RPC call. Returns the response value, or a
@@ -72,21 +75,18 @@ pub fn dispatch(
             Ok(Value::Bool(true))
         }
         "startProcessGroup" => {
-            // Each program is its own group here, so this targets one process.
             let name = str_param(params, 0)?;
-            let (code, desc) = match sup.op_start(&name, now) {
-                Ok(()) => (faults::SUCCESS, "started".to_string()),
-                Err((c, _)) => (c, "error".to_string()),
-            };
-            Ok(Value::Array(vec![result_struct(&name, &name, code, &desc)]))
+            let results = sup.op_start_group(&name, now);
+            Ok(Value::Array(
+                results.iter().map(|(n, g, c, d)| result_struct(n, g, *c, d)).collect(),
+            ))
         }
         "stopProcessGroup" => {
             let name = str_param(params, 0)?;
-            let (code, desc) = match sup.op_stop(&name, now) {
-                Ok(()) => (faults::SUCCESS, "stopped".to_string()),
-                Err((c, _)) => (c, "error".to_string()),
-            };
-            Ok(Value::Array(vec![result_struct(&name, &name, code, &desc)]))
+            let results = sup.op_stop_group(&name, now);
+            Ok(Value::Array(
+                results.iter().map(|(n, g, c, d)| result_struct(n, g, *c, d)).collect(),
+            ))
         }
         "startAllProcesses" => {
             let results = sup.op_start_all(now);
@@ -111,6 +111,27 @@ pub fn dispatch(
         "readProcessStderrLog" => read_log(sup, params, "stderr"),
         "tailProcessStdoutLog" => tail_log(sup, params, "stdout"),
         "tailProcessStderrLog" => tail_log(sup, params, "stderr"),
+
+        "reloadConfig" => {
+            let (added, changed, removed) = sup.reload_config()?;
+            let to_arr = |v: Vec<String>| Value::Array(v.into_iter().map(Value::Str).collect());
+            // Shape: [[added, changed, removed]]
+            Ok(Value::Array(vec![Value::Array(vec![
+                to_arr(added),
+                to_arr(changed),
+                to_arr(removed),
+            ])]))
+        }
+        "addProcessGroup" => {
+            let name = str_param(params, 0)?;
+            sup.add_process_group(&name, now)?;
+            Ok(Value::Bool(true))
+        }
+        "removeProcessGroup" => {
+            let name = str_param(params, 0)?;
+            sup.remove_process_group(&name)?;
+            Ok(Value::Bool(true))
+        }
 
         "shutdown" => {
             sup.request_shutdown();
