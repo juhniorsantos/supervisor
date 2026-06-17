@@ -48,6 +48,10 @@ pub struct Supervisor {
     socket_path: PathBuf,
     listener: UnixListener,
     inet_listener: Option<TcpListener>,
+    /// Monotonic global event serial.
+    event_serial: u64,
+    /// Last emitted tick "slice" for each tick period (epoch-aligned).
+    last_tick: [i64; 3],
 }
 
 impl Supervisor {
@@ -102,6 +106,8 @@ impl Supervisor {
             socket_path,
             listener,
             inet_listener,
+            event_serial: 0,
+            last_tick: [0; 3],
         })
     }
 
@@ -138,6 +144,12 @@ impl Supervisor {
             }
         }
 
+        // Align tick slices to "now" so we don't fire ticks at boot.
+        let boot = self.now_epoch();
+        self.last_tick = [boot - boot % 5, boot - boot % 60, boot - boot % 3600];
+        // Announce that the supervisor is running.
+        self.emit_event("SUPERVISOR_STATE_CHANGE_RUNNING", String::new());
+
         let mut shutting_down = false;
 
         loop {
@@ -149,6 +161,7 @@ impl Supervisor {
             {
                 shutting_down = true;
                 self.log_line("WARN", "stopping all processes");
+                self.emit_event("SUPERVISOR_STATE_CHANGE_STOPPING", String::new());
                 for i in 0..self.processes.len() {
                     self.processes[i].stop(now);
                 }
@@ -167,6 +180,11 @@ impl Supervisor {
                     self.log_line("INFO", &format!("spawned: '{name}' with pid {new_pid}"));
                 }
             }
+
+            // Route process-state and tick events to listeners, then deliver
+            // buffered events to any ready listener.
+            self.route_events();
+            self.dispatch_to_listeners();
 
             self.accept_connections(now);
 
@@ -205,6 +223,74 @@ impl Supervisor {
                 let name = self.processes[idx].name().to_string();
                 let desc = self.processes[idx].status_description(now);
                 self.log_line("INFO", &format!("exited: '{name}' ({desc})"));
+            }
+        }
+    }
+
+    // -- Event subsystem ---------------------------------------------------
+
+    /// Collect process-state events produced this tick, generate any due tick
+    /// events, and buffer them into every subscribed listener.
+    fn route_events(&mut self) {
+        // Drain per-process state-change events (preserving order).
+        let mut events: Vec<(String, String)> = Vec::new();
+        for p in &mut self.processes {
+            if !p.pending_events.is_empty() {
+                events.append(&mut p.pending_events);
+            }
+        }
+
+        // Generate tick events on period boundaries.
+        let now = self.now_epoch();
+        for (idx, &(period, name)) in
+            [(5i64, "TICK_5"), (60, "TICK_60"), (3600, "TICK_3600")].iter().enumerate()
+        {
+            let slice = now - now % period;
+            if self.last_tick[idx] != slice {
+                self.last_tick[idx] = slice;
+                events.push((name.to_string(), format!("when:{now}")));
+            }
+        }
+
+        for (name, payload) in events {
+            self.buffer_to_listeners(&name, payload);
+        }
+    }
+
+    /// Assign a serial to an event and buffer it into every subscribed
+    /// listener pool.
+    fn buffer_to_listeners(&mut self, name: &str, payload: String) {
+        let serial = self.event_serial;
+        self.event_serial += 1;
+        for p in &mut self.processes {
+            if p.is_listener() && p.subscribed_to(name) {
+                p.buffer_event(serial, name, &payload);
+            }
+        }
+    }
+
+    /// A convenience for supervisor-level events (no per-process source).
+    fn emit_event(&mut self, name: &str, payload: String) {
+        self.buffer_to_listeners(name, payload);
+    }
+
+    /// Deliver the oldest buffered event to each ready listener.
+    fn dispatch_to_listeners(&mut self) {
+        let identifier = self.config.supervisord.identifier.clone();
+        for p in &mut self.processes {
+            if !p.listener_ready() {
+                continue;
+            }
+            if let Some((serial, name, payload)) = p.peek_event() {
+                let poolserial = p.pool_serial;
+                p.pool_serial += 1;
+                let envelope = format!(
+                    "ver:3.0 server:{identifier} serial:{serial} pool:{pool} \
+                     poolserial:{poolserial} eventname:{name} len:{len}\n{payload}",
+                    pool = p.pool_name(),
+                    len = payload.len(),
+                );
+                p.send_event(envelope.as_bytes());
             }
         }
     }

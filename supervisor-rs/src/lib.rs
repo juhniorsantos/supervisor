@@ -16,6 +16,7 @@
 pub mod config;
 pub mod control;
 pub mod daemon;
+pub mod events;
 pub mod http;
 pub mod logger;
 pub mod process;

@@ -55,12 +55,47 @@ pub struct Process {
     stderr_logger: RotatingLogger,
     stdout_read: Option<OwnedFd>,
     stderr_read: Option<OwnedFd>,
+    /// Whether the most recent exit was an "expected" one (for EXITED events).
+    last_exit_expected: bool,
+    /// `(event_name, payload)` pairs produced by state changes, drained each
+    /// tick by the supervisor and routed to event listeners.
+    pub pending_events: Vec<(String, String)>,
+    // --- Event listener protocol state (only used when `is_listener`) ------
+    /// Write end of the listener's stdin; the supervisor sends events here.
+    listener_stdin: Option<OwnedFd>,
+    pub listener_state: ListenerState,
+    /// Unparsed bytes read from the listener's stdout protocol stream.
+    listener_buf: Vec<u8>,
+    /// Expected RESULT length while parsing a listener result, if any.
+    result_len: Option<usize>,
+    result_buf: Vec<u8>,
+    /// Per-pool serial counter for outgoing events.
+    pub pool_serial: u64,
+    /// Event names this listener subscribes to (concrete or abstract).
+    subscribed: std::collections::HashSet<String>,
+    /// Buffered events awaiting delivery: `(serial, name, payload)`.
+    event_buffer: std::collections::VecDeque<(u64, String, String)>,
+}
+
+/// The state of an event listener in the notification protocol, mirroring
+/// `EventListenerStates` in the original.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ListenerState {
+    /// Busy: awaiting a `READY` token before it can accept an event.
+    Acknowledged,
+    /// Ready to be sent an event.
+    Ready,
+    /// Processing an event we sent; awaiting its `RESULT`.
+    Busy,
+    /// Protocol desynchronised; no longer eligible for events.
+    Unknown,
 }
 
 impl Process {
     /// Build a process from its configuration, resolving `AUTO` log paths
     /// against `childlogdir`.
     pub fn new(config: ProgramConfig, childlogdir: &std::path::Path) -> Self {
+        let config_events = config.events.clone();
         let stdout_logger = make_logger(
             &config.stdout_logfile,
             childlogdir,
@@ -102,6 +137,74 @@ impl Process {
             stderr_logger,
             stdout_read: None,
             stderr_read: None,
+            last_exit_expected: true,
+            pending_events: Vec::new(),
+            listener_stdin: None,
+            listener_state: ListenerState::Acknowledged,
+            listener_buf: Vec::new(),
+            result_len: None,
+            result_buf: Vec::new(),
+            pool_serial: 0,
+            subscribed: config_events.into_iter().collect(),
+            event_buffer: std::collections::VecDeque::new(),
+        }
+    }
+
+    pub fn is_listener(&self) -> bool {
+        self.config.is_listener
+    }
+
+    /// The pool (group) name used in event envelopes.
+    pub fn pool_name(&self) -> &str {
+        &self.config.group
+    }
+
+    /// Whether this listener is currently eligible to be sent an event.
+    pub fn listener_ready(&self) -> bool {
+        self.config.is_listener
+            && self.state == ProcessState::Running
+            && self.listener_state == ListenerState::Ready
+    }
+
+    /// Whether this listener subscribes to `event_name`.
+    pub fn subscribed_to(&self, event_name: &str) -> bool {
+        crate::events::subscription_matches(&self.subscribed, event_name)
+    }
+
+    /// Buffer an event for later delivery, discarding the oldest if the
+    /// buffer is full (matching the original's overflow behaviour).
+    pub fn buffer_event(&mut self, serial: u64, name: &str, payload: &str) {
+        if self.event_buffer.len() >= self.config.buffer_size {
+            self.event_buffer.pop_front();
+        }
+        self.event_buffer
+            .push_back((serial, name.to_string(), payload.to_string()));
+    }
+
+    /// The oldest buffered event, if any.
+    pub fn peek_event(&self) -> Option<(u64, String, String)> {
+        self.event_buffer.front().cloned()
+    }
+
+    /// Write an event envelope to the listener's stdin and mark it BUSY.
+    /// Returns true if the write succeeded and the event was consumed.
+    pub fn send_event(&mut self, envelope: &[u8]) -> bool {
+        let Some(fd) = self.listener_stdin.as_ref() else {
+            return false;
+        };
+        let n = unsafe {
+            libc::write(
+                fd.as_raw_fd(),
+                envelope.as_ptr() as *const libc::c_void,
+                envelope.len(),
+            )
+        };
+        if n == envelope.len() as isize {
+            self.event_buffer.pop_front();
+            self.listener_state = ListenerState::Busy;
+            true
+        } else {
+            false
         }
     }
 
@@ -132,7 +235,25 @@ impl Process {
 
         let mut cmd = Command::new(&argv[0]);
         cmd.args(&argv[1..]);
-        cmd.stdin(Stdio::null());
+
+        // Event listeners receive events on stdin; give them a pipe we write
+        // to. Ordinary programs get /dev/null.
+        let mut stdin_write: Option<OwnedFd> = None;
+        if self.config.is_listener {
+            match make_blocking_pipe() {
+                Ok((r, w)) => {
+                    cmd.stdin(Stdio::from(r));
+                    stdin_write = Some(w);
+                }
+                Err(e) => {
+                    self.spawnerr = Some(format!("pipe failed: {e}"));
+                    self.fail_to_backoff(now);
+                    return;
+                }
+            }
+        } else {
+            cmd.stdin(Stdio::null());
+        }
 
         let mut err_read: Option<OwnedFd> = None;
         if self.config.redirect_stderr {
@@ -214,6 +335,13 @@ impl Process {
                 self.spawnerr = None;
                 self.stdout_read = Some(out_r);
                 self.stderr_read = err_read;
+                if self.config.is_listener {
+                    self.listener_stdin = stdin_write;
+                    self.listener_state = ListenerState::Acknowledged;
+                    self.listener_buf.clear();
+                    self.result_len = None;
+                    self.result_buf.clear();
+                }
                 self.change_state(ProcessState::Starting);
             }
             Err(e) => {
@@ -224,7 +352,27 @@ impl Process {
     }
 
     fn change_state(&mut self, new: ProcessState) {
+        let from = self.state;
         self.state = new;
+        // Record a PROCESS_STATE_* event for the listener subsystem.
+        let name = crate::events::process_state_event_name(new);
+        let payload = crate::events::process_state_payload(
+            &self.config.name,
+            &self.config.group,
+            from,
+            new,
+            self.pid,
+            self.backoff,
+            self.last_exit_expected,
+        );
+        self.pending_events.push((name.to_string(), payload));
+        // If a listener leaves RUNNING, its protocol state is no longer valid.
+        if self.config.is_listener && new != ProcessState::Running {
+            self.listener_state = ListenerState::Acknowledged;
+            self.listener_buf.clear();
+            self.result_len = None;
+            self.result_buf.clear();
+        }
     }
 
     /// Enter BACKOFF (a failed/too-quick start): bump the counter and set
@@ -245,8 +393,10 @@ impl Process {
 
         let (es, signaled) = decode_status(raw_status);
         let expected = !signaled && self.config.exitcodes.contains(&es);
-        self.pid = 0;
+        self.last_exit_expected = expected;
         self.laststop_sys = Some(SystemTime::now());
+        // Listener pipes are gone once the process exits.
+        self.listener_stdin = None;
 
         match self.state {
             ProcessState::Starting => {
@@ -271,7 +421,6 @@ impl Process {
                 self.backoff = 0;
                 self.delay = None;
                 self.change_state(ProcessState::Exited);
-                let _ = expected; // captured for description; restart decided in transition()
             }
             ProcessState::Stopping => {
                 self.exitstatus = Some(es);
@@ -284,6 +433,8 @@ impl Process {
                 self.change_state(ProcessState::Stopped);
             }
         }
+        // The event payloads above captured the pid; clear it now.
+        self.pid = 0;
     }
 
     /// Advance the state machine. Called every tick.
@@ -420,13 +571,99 @@ impl Process {
     }
 
     /// Read whatever output is currently buffered from the child's pipes
-    /// (non-blocking) and append it to the rotating loggers.
+    /// (non-blocking). For ordinary programs both streams go to the rotating
+    /// loggers; for event listeners, stdout drives the notification protocol
+    /// while stderr is still logged.
     pub fn drain_output(&mut self) {
-        if let Some(fd) = self.stdout_read.as_ref() {
-            drain_fd(fd.as_raw_fd(), &mut self.stdout_logger);
+        if self.config.is_listener {
+            if let Some(fd) = self.stdout_read.as_ref() {
+                let raw = fd.as_raw_fd();
+                let mut buf = [0u8; 4096];
+                loop {
+                    let n = unsafe {
+                        libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len())
+                    };
+                    if n > 0 {
+                        self.listener_buf.extend_from_slice(&buf[..n as usize]);
+                    } else {
+                        break;
+                    }
+                }
+                self.advance_listener_protocol();
+            }
+            if let Some(fd) = self.stderr_read.as_ref() {
+                drain_fd(fd.as_raw_fd(), &mut self.stderr_logger);
+            }
+        } else {
+            if let Some(fd) = self.stdout_read.as_ref() {
+                drain_fd(fd.as_raw_fd(), &mut self.stdout_logger);
+            }
+            if let Some(fd) = self.stderr_read.as_ref() {
+                drain_fd(fd.as_raw_fd(), &mut self.stderr_logger);
+            }
         }
-        if let Some(fd) = self.stderr_read.as_ref() {
-            drain_fd(fd.as_raw_fd(), &mut self.stderr_logger);
+    }
+
+    /// Advance the event-listener protocol state machine over whatever bytes
+    /// have accumulated in `listener_buf` (the READY / RESULT handshake).
+    fn advance_listener_protocol(&mut self) {
+        const READY: &[u8] = b"READY\n";
+        const RESULT: &[u8] = b"RESULT ";
+        loop {
+            match self.listener_state {
+                ListenerState::Acknowledged => {
+                    if self.listener_buf.starts_with(READY) {
+                        self.listener_buf.drain(..READY.len());
+                        self.listener_state = ListenerState::Ready;
+                    } else if self.listener_buf.len() >= READY.len() {
+                        self.listener_state = ListenerState::Unknown;
+                        break;
+                    } else {
+                        break;
+                    }
+                }
+                ListenerState::Ready => break,
+                ListenerState::Busy => {
+                    if self.result_len.is_none() {
+                        let Some(nl) = self.listener_buf.iter().position(|&b| b == b'\n') else {
+                            break;
+                        };
+                        let line = self.listener_buf[..nl].to_vec();
+                        if line.starts_with(RESULT) {
+                            let num = String::from_utf8_lossy(&line[RESULT.len()..]);
+                            match num.trim().parse::<usize>() {
+                                Ok(len) => {
+                                    self.listener_buf.drain(..=nl);
+                                    self.result_len = Some(len);
+                                }
+                                Err(_) => {
+                                    self.listener_state = ListenerState::Unknown;
+                                    break;
+                                }
+                            }
+                        } else {
+                            self.listener_state = ListenerState::Unknown;
+                            break;
+                        }
+                    } else {
+                        let want = self.result_len.unwrap();
+                        let need = want - self.result_buf.len();
+                        let take = need.min(self.listener_buf.len());
+                        let chunk: Vec<u8> = self.listener_buf.drain(..take).collect();
+                        self.result_buf.extend_from_slice(&chunk);
+                        if self.result_buf.len() >= want {
+                            // Result received (OK/FAIL); ready for the next event
+                            // once the listener writes READY again.
+                            self.result_len = None;
+                            self.result_buf.clear();
+                            self.listener_state = ListenerState::Acknowledged;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+                ListenerState::Unknown => break,
+            }
         }
     }
 
@@ -477,7 +714,7 @@ impl Process {
         let description = self.interpret_description(start, stop, now_epoch);
         ProcessInfo {
             name: self.config.name.clone(),
-            group: self.config.name.clone(), // each program is its own group
+            group: self.config.group.clone(),
             state: self.state as i64,
             statename: self.state.description().to_string(),
             pid: self.pid,
@@ -643,6 +880,21 @@ fn make_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     }
     let read = unsafe { OwnedFd::from_raw_fd(read) };
     let write = unsafe { OwnedFd::from_raw_fd(write) };
+    Ok((read, write))
+}
+
+/// Create a close-on-exec pipe with both ends left in blocking mode. Used for
+/// an event listener's stdin, which the child reads with ordinary blocking
+/// reads. Returns `(read, write)`.
+fn make_blocking_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let mut fds = [0i32; 2];
+    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let read = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+    let write = unsafe { OwnedFd::from_raw_fd(fds[1]) };
     Ok((read, write))
 }
 

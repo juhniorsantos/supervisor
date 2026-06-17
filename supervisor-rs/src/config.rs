@@ -48,6 +48,10 @@ pub enum LogTarget {
 #[derive(Clone, Debug)]
 pub struct ProgramConfig {
     pub name: String,
+    /// The base program/eventlistener section name (before numprocs expansion).
+    pub program: String,
+    /// The group this instance belongs to (defaults to `program`).
+    pub group: String,
     pub command: String,
     pub directory: Option<PathBuf>,
     pub autostart: bool,
@@ -68,6 +72,13 @@ pub struct ProgramConfig {
     pub stderr_logfile: LogTarget,
     pub stderr_logfile_maxbytes: u64,
     pub stderr_logfile_backups: u32,
+    /// True for `[eventlistener:x]` sections: the process speaks the event
+    /// notification protocol on its stdin/stdout.
+    pub is_listener: bool,
+    /// Event type names this listener subscribes to (abstract or concrete).
+    pub events: Vec<String>,
+    /// Listener event buffer size.
+    pub buffer_size: usize,
 }
 
 /// Configuration for the `[supervisord]` section.
@@ -396,11 +407,53 @@ impl Config {
                     password: m.get("password").map(|s| s.to_string()),
                 };
             } else if let Some(prog) = sec.name.strip_prefix("program:") {
-                let expanded = parse_program(prog.trim(), &sec.items, &supervisord)?;
+                let expanded = parse_program(prog.trim(), &sec.items, &supervisord, false)?;
+                programs.extend(expanded);
+            } else if let Some(listener) = sec.name.strip_prefix("eventlistener:") {
+                let expanded = parse_program(listener.trim(), &sec.items, &supervisord, true)?;
                 programs.extend(expanded);
             }
-            // Other sections (rpcinterface, supervisorctl, eventlistener,
-            // inet_http_server, group) are accepted but ignored in this core.
+            // Other sections (rpcinterface, supervisorctl) are accepted but
+            // ignored in this core. `group:` sections are processed below.
+        }
+
+        // Apply `[group:x]` membership: every instance of a referenced program
+        // joins that group. Programs not named by any group keep their
+        // homogeneous group (group == program name).
+        for sec in &sections {
+            if let Some(group_name) = sec.name.strip_prefix("group:") {
+                let group_name = group_name.trim().to_string();
+                let m = items_map(&sec.items);
+                let members: Vec<String> = m
+                    .get("programs")
+                    .map(|v| {
+                        v.split(',')
+                            .map(|s| s.trim().to_string())
+                            .filter(|s| !s.is_empty())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                let group_priority = m
+                    .get("priority")
+                    .map(|v| v.parse())
+                    .transpose()
+                    .map_err(|_| "invalid group priority")?;
+                for member in &members {
+                    let mut found = false;
+                    for p in programs.iter_mut() {
+                        if &p.program == member {
+                            p.group = group_name.clone();
+                            if let Some(prio) = group_priority {
+                                p.priority = prio;
+                            }
+                            found = true;
+                        }
+                    }
+                    if !found {
+                        return Err(format!("[group:{group_name}] names unknown program {member}"));
+                    }
+                }
+            }
         }
 
         // Order programs by priority for deterministic startup.
@@ -478,12 +531,14 @@ fn parse_program(
     name: &str,
     items: &[(String, String)],
     supervisord: &SupervisordConfig,
+    is_listener: bool,
 ) -> Result<Vec<ProgramConfig>, String> {
     let m = items_map(items);
 
+    let kind = if is_listener { "eventlistener" } else { "program" };
     let command = m
         .get("command")
-        .ok_or_else(|| format!("[program:{name}] is missing required 'command'"))?
+        .ok_or_else(|| format!("[{kind}:{name}] is missing required 'command'"))?
         .to_string();
 
     let numprocs: usize = m
@@ -536,8 +591,28 @@ fn parse_program(
         None => None,
         Some(v) => Some(u32::from_str_radix(v.trim_start_matches("0o").trim(), 8).map_err(|_| "invalid umask")?),
     };
-    let priority = m.get("priority").map(|v| v.parse()).transpose().map_err(|_| "invalid priority")?.unwrap_or(999);
-    let redirect_stderr = m.get("redirect_stderr").map(|v| parse_bool(v)).transpose()?.unwrap_or(false);
+    // Listeners default to a high (low-numbered) priority so they start
+    // before the programs whose events they want to observe.
+    let default_priority = if is_listener { -1 } else { 999 };
+    let priority = m.get("priority").map(|v| v.parse()).transpose().map_err(|_| "invalid priority")?.unwrap_or(default_priority);
+    // Event listeners must keep stderr separate so it can't corrupt the
+    // protocol stream on stdout.
+    let redirect_stderr = if is_listener {
+        false
+    } else {
+        m.get("redirect_stderr").map(|v| parse_bool(v)).transpose()?.unwrap_or(false)
+    };
+
+    let buffer_size = m.get("buffer_size").map(|v| v.parse()).transpose().map_err(|_| "invalid buffer_size")?.unwrap_or(10);
+    let events: Vec<String> = m
+        .get("events")
+        .map(|v| {
+            v.split(',')
+                .map(|s| s.trim().to_ascii_uppercase())
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
 
     let stdout_logfile = parse_log_target(m.get("stdout_logfile").copied());
     let stdout_logfile_maxbytes = m.get("stdout_logfile_maxbytes").map(|v| parse_byte_size(v)).transpose()?.unwrap_or(50 * 1024 * 1024);
@@ -561,6 +636,8 @@ fn parse_program(
         }
         out.push(ProgramConfig {
             name: inst_name,
+            program: name.to_string(),
+            group: name.to_string(),
             command: command.clone(),
             directory: directory.clone(),
             autostart,
@@ -581,6 +658,9 @@ fn parse_program(
             stderr_logfile: stderr_logfile.clone(),
             stderr_logfile_maxbytes,
             stderr_logfile_backups,
+            is_listener,
+            events: events.clone(),
+            buffer_size,
         });
     }
     Ok(out)

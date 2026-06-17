@@ -114,15 +114,16 @@ fn cmd_status(socket: &Path, args: &[String]) {
     let mut shown = false;
     for info in &infos {
         let name = get_str(info, "name");
+        let namespec = make_namespec(&get_str(info, "group"), &name);
         if let Some(w) = want {
-            if &name != w {
+            if &name != w && &namespec != w {
                 continue;
             }
         }
         shown = true;
         println!(
             "{:<28} {:<10} {}",
-            name,
+            namespec,
             get_str(info, "statename"),
             get_str(info, "description")
         );
@@ -300,6 +301,16 @@ fn as_int(v: &Value) -> i64 {
     match v {
         Value::Int(i) => *i,
         _ => 0,
+    }
+}
+
+/// `name` if the group equals the name, else `group:name` (matches the
+/// original `make_namespec`).
+fn make_namespec(group: &str, name: &str) -> String {
+    if group == name || group.is_empty() {
+        name.to_string()
+    } else {
+        format!("{group}:{name}")
     }
 }
 

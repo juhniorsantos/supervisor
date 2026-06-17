@@ -29,10 +29,15 @@ pub fn render(sup: &mut Supervisor, query: &str, now: Instant) -> String {
     for info in &infos {
         let state = state_from_code(info.state);
         let css = state_class(state);
+        let namespec = if info.group == info.name || info.group.is_empty() {
+            info.name.clone()
+        } else {
+            format!("{}:{}", info.group, info.name)
+        };
         rows.push_str(&format!(
             "<tr>\
                <td><span class=\"state {css}\">{statename}</span></td>\
-               <td class=\"name\">{name}</td>\
+               <td class=\"name\">{display}</td>\
                <td class=\"desc\">{desc}</td>\
                <td class=\"actions\">\
                  <a href=\"/?action=start&name={name}\">start</a>\
@@ -42,6 +47,7 @@ pub fn render(sup: &mut Supervisor, query: &str, now: Instant) -> String {
              </tr>",
             css = css,
             statename = html_escape(&info.statename),
+            display = html_escape(&namespec),
             name = html_escape(&info.name),
             desc = html_escape(&info.description),
         ));

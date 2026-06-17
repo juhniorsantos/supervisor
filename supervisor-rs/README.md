@@ -60,6 +60,7 @@ The crate is split into focused modules (`src/`):
 | `http.rs`     | A tiny HTTP/1.1 request/response core (+ Basic auth). |
 | `xmlrpc.rs`   | A dependency-free XML-RPC parser/serializer. |
 | `rpc.rs`      | The `supervisor.*` XML-RPC method set (API 3.0). |
+| `events.rs`   | Event names, payloads and listener-subscription matching. |
 | `web.rs`      | The web management UI served at `GET /`. |
 | `control.rs`  | XML-RPC-over-HTTP client used by `supervisorctl`. |
 | `bin/supervisord.rs`   | Daemon entry point (arg parsing, daemonize, pidfile). |
@@ -137,11 +138,14 @@ Implemented (the MVP you asked for):
 - [x] `[inet_http_server]` TCP control + HTTP Basic auth
 - [x] Compatibility with the upstream Python `supervisorctl`
 - [x] `supervisorctl tail`, `reload` (daemon `restart` via re-exec)
+- [x] **`[group:x]` sections** with `programs=`/`priority`, plus `group:name` namespecs
+- [x] **Event listeners** (`[eventlistener:x]`): the full READY/RESULT protocol,
+      `PROCESS_STATE_*`, `TICK_5/60/3600` and `SUPERVISOR_STATE_CHANGE_*`
+      events with upstream-compatible envelopes (works with real listener
+      scripts), `events=` subscriptions and `buffer_size`
 
 Not yet ported (natural next phases):
 
-- [ ] Event listeners / the event notification protocol
-- [ ] `[group:x]` sections (each program is currently its own group)
 - [ ] `supervisorctl fg`, log capture mode, `reread`/`update`/`add`/`remove`
 - [ ] Syslog output, config `[include]` files
 - [ ] Additional RPC methods (`signalProcess`, `clearLog`, `sendProcessStdin`, …)
