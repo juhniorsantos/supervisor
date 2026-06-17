@@ -71,7 +71,10 @@ The crate is split into focused modules (`src/`):
 The daemon runs a single-threaded tick loop (~100 ms): it reaps exited
 children with `waitpid(WNOHANG)`, drains their stdout/stderr pipes into the
 rotating loggers, advances every process's state machine, and services any
-pending control connections.
+pending control connections. Control I/O is fully non-blocking — requests are
+parsed and responses are written incrementally across ticks — so a slow or
+stalled client can never block process supervision. HTTP Basic credentials
+are checked in constant time.
 
 ### Control over HTTP / XML-RPC
 

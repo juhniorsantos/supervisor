@@ -8,10 +8,10 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::TcpListener;
-use std::os::unix::net::UnixListener;
+use std::net::{TcpListener, TcpStream};
+use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, OwnedFd, RawFd};
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -61,7 +61,13 @@ fn install_signal_handlers() {
 /// Block until a control connection arrives, a child exits, or `timeout_ms`
 /// elapses — whichever comes first. Replaces a blind sleep so control and
 /// reaping are near-instant while timers still tick at the timeout cadence.
-fn poll_wait(unix_fd: i32, inet_fd: Option<i32>, sigchld_fd: i32, timeout_ms: i32) {
+fn poll_wait(
+    unix_fd: i32,
+    inet_fd: Option<i32>,
+    sigchld_fd: i32,
+    conn_fds: &[RawFd],
+    timeout_ms: i32,
+) {
     let mut fds = vec![
         libc::pollfd {
             fd: unix_fd,
@@ -78,6 +84,14 @@ fn poll_wait(unix_fd: i32, inet_fd: Option<i32>, sigchld_fd: i32, timeout_ms: i3
         fds.push(libc::pollfd {
             fd,
             events: libc::POLLIN,
+            revents: 0,
+        });
+    }
+    // Wake as soon as any in-flight connection is readable or writable.
+    for &fd in conn_fds {
+        fds.push(libc::pollfd {
+            fd,
+            events: libc::POLLIN | libc::POLLOUT,
             revents: 0,
         });
     }
@@ -104,6 +118,113 @@ fn make_self_pipe() -> (i32, i32) {
         return (-1, -1);
     }
     (fds[0], fds[1])
+}
+
+/// Max simultaneous in-flight control connections (guards against fd
+/// exhaustion from a flood of slow clients).
+const MAX_CONNECTIONS: usize = 1024;
+/// A control connection that makes no progress within this window is dropped.
+const CONN_DEADLINE_SECS: u64 = 30;
+
+/// A control-socket stream, unix or TCP, handled uniformly and non-blocking.
+enum Stream {
+    Unix(UnixStream),
+    Tcp(TcpStream),
+}
+
+impl Stream {
+    fn raw_fd(&self) -> RawFd {
+        match self {
+            Stream::Unix(s) => s.as_raw_fd(),
+            Stream::Tcp(s) => s.as_raw_fd(),
+        }
+    }
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Unix(s) => s.read(buf),
+            Stream::Tcp(s) => s.read(buf),
+        }
+    }
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            Stream::Unix(s) => s.write(buf),
+            Stream::Tcp(s) => s.write(buf),
+        }
+    }
+}
+
+/// The outcome of a non-blocking read attempt on a connection.
+enum ReadStep {
+    NeedMore,
+    Complete(crate::http::Request),
+    Close,
+}
+
+/// An in-progress control connection, serviced incrementally so a slow or
+/// stalled client can never block the supervisor's event loop.
+struct Conn {
+    stream: Stream,
+    auth: HttpAuth,
+    inbuf: Vec<u8>,
+    outbuf: Vec<u8>,
+    outpos: usize,
+    /// False while reading the request, true once we're writing the response.
+    writing: bool,
+    deadline: Instant,
+}
+
+impl Conn {
+    fn new(stream: Stream, auth: HttpAuth, now: Instant) -> Self {
+        Conn {
+            stream,
+            auth,
+            inbuf: Vec::new(),
+            outbuf: Vec::new(),
+            outpos: 0,
+            writing: false,
+            deadline: now + Duration::from_secs(CONN_DEADLINE_SECS),
+        }
+    }
+
+    /// Read whatever is available (non-blocking) and report whether a full
+    /// request has arrived.
+    fn read_step(&mut self) -> ReadStep {
+        let mut buf = [0u8; 8192];
+        loop {
+            match self.stream.read(&mut buf) {
+                Ok(0) => return ReadStep::Close, // EOF before a full request
+                Ok(n) => {
+                    self.inbuf.extend_from_slice(&buf[..n]);
+                    if self.inbuf.len() > 64 * 1024 * 1024 {
+                        return ReadStep::Close;
+                    }
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return ReadStep::Close,
+            }
+        }
+        match crate::http::try_parse_request(&self.inbuf) {
+            crate::http::Parsed::Complete(req) => ReadStep::Complete(req),
+            crate::http::Parsed::Incomplete => ReadStep::NeedMore,
+            crate::http::Parsed::Malformed => ReadStep::Close,
+        }
+    }
+
+    /// Flush as much of the queued response as the socket accepts. Returns
+    /// true once the response is fully written (or the peer is gone).
+    fn write_step(&mut self) -> bool {
+        while self.outpos < self.outbuf.len() {
+            match self.stream.write(&self.outbuf[self.outpos..]) {
+                Ok(0) => return true,
+                Ok(n) => self.outpos += n,
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+                Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(_) => return true,
+            }
+        }
+        true
+    }
 }
 
 /// The running supervisor: owns every process and the control endpoints.
@@ -134,6 +255,8 @@ pub struct Supervisor {
     /// Shared FastCGI listening sockets, one per fcgi group, kept alive for as
     /// long as the group is active and handed to each child as fd 0.
     fcgi_listeners: HashMap<String, OwnedFd>,
+    /// In-flight control connections, serviced non-blocking each tick.
+    connections: Vec<Conn>,
 }
 
 impl Supervisor {
@@ -212,6 +335,7 @@ impl Supervisor {
             available_configs: grouped.clone(),
             active_group_configs: grouped,
             fcgi_listeners: HashMap::new(),
+            connections: Vec::new(),
         };
         sup.wire_fcgi()?;
         Ok(sup)
@@ -309,15 +433,16 @@ impl Supervisor {
             self.route_events();
             self.dispatch_to_listeners();
 
-            self.accept_connections(now);
+            self.service_connections(now);
 
             if shutting_down && self.all_stopped() {
                 break;
             }
 
-            // Wait for the next control connection, child exit, or 100 ms
-            // timer tick — whichever is first.
-            poll_wait(unix_fd, inet_fd, sigchld_read, 100);
+            // Wait for the next control connection/activity, child exit, or
+            // 100 ms timer tick — whichever is first.
+            let conn_fds = self.connection_fds();
+            poll_wait(unix_fd, inet_fd, sigchld_read, &conn_fds, 100);
         }
 
         SIGCHLD_PIPE_WRITE.store(-1, Ordering::SeqCst);
@@ -444,97 +569,119 @@ impl Supervisor {
         }
     }
 
-    // -- Control server ----------------------------------------------------
+    // -- Control server (non-blocking) -------------------------------------
 
-    fn accept_connections(&mut self, now: Instant) {
-        // Unix socket connections.
+    /// Accept any pending connections, then advance every in-flight one. All
+    /// I/O here is non-blocking, so a slow or stalled client can never stall
+    /// the supervisor's event loop or delay process reaping.
+    fn service_connections(&mut self, now: Instant) {
+        self.accept_new_connections(now);
+
+        let mut i = 0;
+        while i < self.connections.len() {
+            let mut finished = false;
+
+            if now >= self.connections[i].deadline {
+                finished = true; // stalled client; drop it
+            } else if !self.connections[i].writing {
+                match self.connections[i].read_step() {
+                    ReadStep::NeedMore => {}
+                    ReadStep::Close => finished = true,
+                    ReadStep::Complete(req) => {
+                        let auth = self.connections[i].auth.clone();
+                        let resp = self.build_http_response(&req, &auth, now);
+                        let c = &mut self.connections[i];
+                        c.outbuf = resp;
+                        c.outpos = 0;
+                        c.writing = true;
+                        finished = c.write_step();
+                    }
+                }
+            } else {
+                finished = self.connections[i].write_step();
+            }
+
+            if finished {
+                self.connections.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    fn accept_new_connections(&mut self, now: Instant) {
         loop {
+            if self.connections.len() >= MAX_CONNECTIONS {
+                break;
+            }
             match self.listener.accept() {
-                Ok((mut s, _)) => {
+                Ok((s, _)) => {
+                    let _ = s.set_nonblocking(true);
                     let auth = self.config.unix_auth.clone();
-                    let _ = s.set_nonblocking(false);
-                    let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
-                    self.serve_http(&mut s, auth, now);
+                    self.connections.push(Conn::new(Stream::Unix(s), auth, now));
                 }
                 Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
         }
-        // Inet (TCP) connections.
-        if self.inet_listener.is_some() {
-            loop {
-                let accepted = self.inet_listener.as_ref().unwrap().accept();
-                match accepted {
-                    Ok((mut s, _)) => {
-                        let auth = self.config.inet_auth.clone();
-                        let _ = s.set_nonblocking(false);
-                        let _ = s.set_read_timeout(Some(Duration::from_secs(5)));
-                        self.serve_http(&mut s, auth, now);
-                    }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
+        loop {
+            if self.connections.len() >= MAX_CONNECTIONS {
+                break;
+            }
+            let accepted = match &self.inet_listener {
+                Some(l) => l.accept(),
+                None => break,
+            };
+            match accepted {
+                Ok((s, _)) => {
+                    let _ = s.set_nonblocking(true);
+                    let auth = self.config.inet_auth.clone();
+                    self.connections.push(Conn::new(Stream::Tcp(s), auth, now));
                 }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => break,
             }
         }
     }
 
-    /// Read and respond to a single HTTP request on `stream`.
-    fn serve_http<S: Read + Write>(&mut self, stream: &mut S, auth: HttpAuth, now: Instant) {
-        let req = match crate::http::read_request(stream) {
-            Some(r) => r,
-            None => return,
-        };
+    /// File descriptors of in-flight connections, for the poll set.
+    fn connection_fds(&self) -> Vec<RawFd> {
+        self.connections.iter().map(|c| c.stream.raw_fd()).collect()
+    }
 
-        // Optional HTTP Basic auth.
-        if auth.is_set() {
-            let ok = req
-                .basic_auth()
-                .map(|(u, p)| {
-                    Some(u) == auth.username
-                        && (auth.password.is_none() || Some(p) == auth.password)
-                })
-                .unwrap_or(false);
-            if !ok {
-                crate::http::write_response(
-                    stream,
-                    401,
-                    "Unauthorized",
-                    "text/plain",
-                    "401 Unauthorized\n",
-                    &[("WWW-Authenticate", "Basic realm=\"supervisor\"")],
-                );
-                return;
-            }
+    /// Turn a parsed request into the bytes of an HTTP response, enforcing
+    /// optional Basic auth and routing to XML-RPC or the web UI.
+    fn build_http_response(&mut self, req: &crate::http::Request, auth: &HttpAuth, now: Instant) -> Vec<u8> {
+        // Optional HTTP Basic auth, compared in constant time.
+        if auth.is_set() && !authorized(req, auth) {
+            return crate::http::format_response(
+                401,
+                "Unauthorized",
+                "text/plain",
+                "401 Unauthorized\n",
+                &[("WWW-Authenticate", "Basic realm=\"supervisor\"")],
+            );
         }
 
-        let path = req.path.clone();
-        let route = path.split_once('?').map(|(p, _)| p).unwrap_or(&path);
+        let route = req.path.split_once('?').map(|(p, _)| p).unwrap_or(&req.path);
 
         if req.method == "POST" && route == "/RPC2" {
-            // XML-RPC endpoint.
-            match crate::xmlrpc::parse_method_call(&req.body) {
-                Ok((method, params)) => {
-                    let body = match rpc::dispatch(self, &method, &params, now) {
-                        Ok(value) => crate::xmlrpc::serialize_response(&value),
-                        Err((code, msg)) => crate::xmlrpc::serialize_fault(code, &msg),
-                    };
-                    crate::http::write_response(stream, 200, "OK", "text/xml", &body, &[]);
-                }
-                Err(e) => {
-                    let body = crate::xmlrpc::serialize_fault(1, &format!("malformed call: {e}"));
-                    crate::http::write_response(stream, 200, "OK", "text/xml", &body, &[]);
-                }
-            }
+            let body = match crate::xmlrpc::parse_method_call(&req.body) {
+                Ok((method, params)) => match rpc::dispatch(self, &method, &params, now) {
+                    Ok(value) => crate::xmlrpc::serialize_response(&value),
+                    Err((code, msg)) => crate::xmlrpc::serialize_fault(code, &msg),
+                },
+                Err(e) => crate::xmlrpc::serialize_fault(1, &format!("malformed call: {e}")),
+            };
+            crate::http::format_response(200, "OK", "text/xml", &body, &[])
         } else if req.method == "POST" {
-            // Web UI action submitted as a form POST. Actions are never taken
-            // on a GET, so the page is safe to refresh/prefetch.
+            // Web UI action submitted as a form POST (never on a GET).
             let params = web::parse_form(&req.body);
             let html = web::render(self, &params, now);
-            crate::http::write_response(stream, 200, "OK", "text/html; charset=utf-8", &html, &[]);
+            crate::http::format_response(200, "OK", "text/html; charset=utf-8", &html, &[])
         } else {
-            // Web UI (GET): render status with no side effects.
             let html = web::render(self, &[], now);
-            crate::http::write_response(stream, 200, "OK", "text/html; charset=utf-8", &html, &[]);
+            crate::http::format_response(200, "OK", "text/html; charset=utf-8", &html, &[])
         }
     }
 
@@ -1133,6 +1280,24 @@ fn group_configs(
         map.entry(p.group.clone()).or_default().push(p.clone());
     }
     map
+}
+
+/// Check HTTP Basic credentials in constant time. Returns true when no auth
+/// is configured.
+fn authorized(req: &crate::http::Request, auth: &HttpAuth) -> bool {
+    let Some(want_user) = auth.username.as_deref() else {
+        return true;
+    };
+    let Some((user, pass)) = req.basic_auth() else {
+        return false;
+    };
+    let user_ok = crate::util::constant_time_eq(user.as_bytes(), want_user.as_bytes());
+    let pass_ok = match auth.password.as_deref() {
+        Some(want_pass) => crate::util::constant_time_eq(pass.as_bytes(), want_pass.as_bytes()),
+        None => true,
+    };
+    // Non-short-circuiting so both checks always run.
+    user_ok & pass_ok
 }
 
 /// Map a fault code to the short message the web UI shows.

@@ -2,7 +2,7 @@
 //! path, headers, body) and write one response back over any stream. Used
 //! for both the XML-RPC endpoint (`POST /RPC2`) and the web UI (`GET /`).
 
-use std::io::{Read, Write};
+use std::io::Read;
 
 /// A parsed HTTP request.
 pub struct Request {
@@ -96,15 +96,77 @@ pub fn read_request<S: Read>(stream: &mut S) -> Option<Request> {
     })
 }
 
-/// Write a complete HTTP response.
-pub fn write_response<S: Write>(
-    stream: &mut S,
+/// Outcome of an incremental request parse.
+pub enum Parsed {
+    /// A full request (headers + body) is available.
+    Complete(Request),
+    /// More bytes are needed.
+    Incomplete,
+    /// The request is malformed or implausibly large; close the connection.
+    Malformed,
+}
+
+/// Try to parse a complete HTTP request from `buf` without blocking.
+pub fn try_parse_request(buf: &[u8]) -> Parsed {
+    let Some(pos) = crate::util::find_subslice(buf, b"\r\n\r\n") else {
+        // Headers not complete yet; bound how much we'll buffer.
+        return if buf.len() > 256 * 1024 {
+            Parsed::Malformed
+        } else {
+            Parsed::Incomplete
+        };
+    };
+    let header_end = pos + 4;
+
+    let header_text = String::from_utf8_lossy(&buf[..header_end]).to_string();
+    let mut lines = header_text.split("\r\n");
+    let Some(request_line) = lines.next() else {
+        return Parsed::Malformed;
+    };
+    let mut parts = request_line.split_whitespace();
+    let (Some(method), Some(path)) = (parts.next(), parts.next()) else {
+        return Parsed::Malformed;
+    };
+    let (method, path) = (method.to_string(), path.to_string());
+
+    let mut headers = Vec::new();
+    let mut content_length = 0usize;
+    for line in lines {
+        if line.is_empty() {
+            continue;
+        }
+        if let Some((k, v)) = line.split_once(':') {
+            let k = k.trim().to_string();
+            let v = v.trim().to_string();
+            if k.eq_ignore_ascii_case("content-length") {
+                content_length = v.parse().unwrap_or(0);
+            }
+            headers.push((k, v));
+        }
+    }
+    if content_length > 64 * 1024 * 1024 {
+        return Parsed::Malformed; // implausible body
+    }
+    if buf.len() < header_end + content_length {
+        return Parsed::Incomplete; // body not fully arrived
+    }
+    let body = String::from_utf8_lossy(&buf[header_end..header_end + content_length]).to_string();
+    Parsed::Complete(Request {
+        method,
+        path,
+        headers,
+        body,
+    })
+}
+
+/// Build the bytes of a complete HTTP response.
+pub fn format_response(
     status: u16,
     reason: &str,
     content_type: &str,
     body: &str,
     extra_headers: &[(&str, &str)],
-) {
+) -> Vec<u8> {
     let mut head = format!(
         "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
@@ -116,9 +178,9 @@ pub fn write_response<S: Write>(
         head.push_str("\r\n");
     }
     head.push_str("\r\n");
-    let _ = stream.write_all(head.as_bytes());
-    let _ = stream.write_all(body.as_bytes());
-    let _ = stream.flush();
+    let mut out = head.into_bytes();
+    out.extend_from_slice(body.as_bytes());
+    out
 }
 
 /// Minimal standard base64 decoder (no external crates).
@@ -180,6 +242,29 @@ mod tests {
         assert_eq!(req.path, "/RPC2");
         assert_eq!(req.body, "hello");
         assert_eq!(req.header("host"), Some("x"));
+    }
+
+    #[test]
+    fn incremental_parse_waits_for_full_request() {
+        // Headers without the terminating blank line -> incomplete.
+        assert!(matches!(
+            try_parse_request(b"POST /RPC2 HTTP/1.1\r\nContent-Length: 5\r\n"),
+            Parsed::Incomplete
+        ));
+        // Headers complete but body not fully arrived -> incomplete.
+        assert!(matches!(
+            try_parse_request(b"POST /RPC2 HTTP/1.1\r\nContent-Length: 5\r\n\r\nhel"),
+            Parsed::Incomplete
+        ));
+        // Full request -> complete, with the exact body.
+        match try_parse_request(b"POST /RPC2 HTTP/1.1\r\nContent-Length: 5\r\n\r\nhello") {
+            Parsed::Complete(req) => {
+                assert_eq!(req.method, "POST");
+                assert_eq!(req.path, "/RPC2");
+                assert_eq!(req.body, "hello");
+            }
+            _ => panic!("expected a complete request"),
+        }
     }
 
     #[test]
