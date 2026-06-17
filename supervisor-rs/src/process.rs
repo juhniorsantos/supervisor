@@ -73,6 +73,9 @@ pub struct Process {
     result_buf: Vec<u8>,
     /// Per-pool serial counter for outgoing events.
     pub pool_serial: u64,
+    /// Capture-mode scanners for the stdout/stderr communication protocol.
+    stdout_capture: CaptureState,
+    stderr_capture: CaptureState,
     /// Event names this listener subscribes to (concrete or abstract).
     subscribed: std::collections::HashSet<String>,
     /// Buffered events awaiting delivery: `(serial, name, payload)`.
@@ -91,6 +94,18 @@ pub enum ListenerState {
     Busy,
     /// Protocol desynchronised; no longer eligible for events.
     Unknown,
+}
+
+/// Streaming scanner state for the `<!--XSUPERVISOR:BEGIN-->` /
+/// `<!--XSUPERVISOR:END-->` process-communication capture protocol.
+#[derive(Default)]
+struct CaptureState {
+    /// Bytes not yet classified (may hold a partial token across reads).
+    buf: Vec<u8>,
+    /// Whether we are currently between BEGIN and END markers.
+    in_capture: bool,
+    /// Bytes captured for the current event.
+    captured: Vec<u8>,
 }
 
 impl Process {
@@ -147,6 +162,8 @@ impl Process {
             result_len: None,
             result_buf: Vec::new(),
             pool_serial: 0,
+            stdout_capture: CaptureState::default(),
+            stderr_capture: CaptureState::default(),
             subscribed: config_events.into_iter().collect(),
             event_buffer: std::collections::VecDeque::new(),
         }
@@ -632,12 +649,75 @@ impl Process {
                 drain_fd(fd.as_raw_fd(), &mut self.stderr_logger);
             }
         } else {
-            if let Some(fd) = self.stdout_read.as_ref() {
-                drain_fd(fd.as_raw_fd(), &mut self.stdout_logger);
+            self.drain_stream(true);
+            self.drain_stream(false);
+        }
+    }
+
+    /// Drain one ordinary-program stream. When capture is enabled, scan for
+    /// the communication markers and emit `PROCESS_COMMUNICATION_*` events for
+    /// captured spans; otherwise append straight to the logger.
+    fn drain_stream(&mut self, is_stdout: bool) {
+        let fd = if is_stdout {
+            self.stdout_read.as_ref()
+        } else {
+            self.stderr_read.as_ref()
+        };
+        let Some(fd) = fd else { return };
+        let raw = fd.as_raw_fd();
+
+        let maxbytes = if is_stdout {
+            self.config.stdout_capture_maxbytes
+        } else {
+            self.config.stderr_capture_maxbytes
+        };
+
+        if maxbytes == 0 {
+            let logger = if is_stdout {
+                &mut self.stdout_logger
+            } else {
+                &mut self.stderr_logger
+            };
+            drain_fd(raw, logger);
+            return;
+        }
+
+        // Capture-enabled: read available bytes, then run the scanner.
+        let mut data = Vec::new();
+        let mut buf = [0u8; 8192];
+        loop {
+            let n = unsafe { libc::read(raw, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+            if n > 0 {
+                data.extend_from_slice(&buf[..n as usize]);
+            } else {
+                break;
             }
-            if let Some(fd) = self.stderr_read.as_ref() {
-                drain_fd(fd.as_raw_fd(), &mut self.stderr_logger);
-            }
+        }
+        if data.is_empty() {
+            return;
+        }
+
+        let (state, logger) = if is_stdout {
+            (&mut self.stdout_capture, &mut self.stdout_logger)
+        } else {
+            (&mut self.stderr_capture, &mut self.stderr_logger)
+        };
+        let completed = scan_capture(state, &data, maxbytes as usize, logger);
+
+        let event_name = if is_stdout {
+            "PROCESS_COMMUNICATION_STDOUT"
+        } else {
+            "PROCESS_COMMUNICATION_STDERR"
+        };
+        for captured in completed {
+            let payload = format!(
+                "processname:{} groupname:{} pid:{}\n{}",
+                self.config.name,
+                self.config.group,
+                self.pid,
+                String::from_utf8_lossy(&captured)
+            );
+            self.pending_events.push((event_name.to_string(), payload));
         }
     }
 
@@ -886,6 +966,77 @@ fn decode_status(status: i32) -> (i32, bool) {
     }
 }
 
+const CAPTURE_BEGIN: &[u8] = b"<!--XSUPERVISOR:BEGIN-->";
+const CAPTURE_END: &[u8] = b"<!--XSUPERVISOR:END-->";
+
+/// Feed `incoming` bytes through the capture scanner. Bytes outside
+/// BEGIN/END markers are written to `logger`; bytes inside are accumulated
+/// (capped at `maxbytes`). Returns the payloads of any completed captures.
+fn scan_capture(
+    state: &mut CaptureState,
+    incoming: &[u8],
+    maxbytes: usize,
+    logger: &mut RotatingLogger,
+) -> Vec<Vec<u8>> {
+    let mut completed = Vec::new();
+    state.buf.extend_from_slice(incoming);
+
+    loop {
+        if !state.in_capture {
+            if let Some(i) = find_subslice(&state.buf, CAPTURE_BEGIN) {
+                logger.write(&state.buf[..i]);
+                state.buf.drain(..i + CAPTURE_BEGIN.len());
+                state.in_capture = true;
+            } else {
+                // Flush all but a possible split BEGIN token at the tail.
+                let hold = prefix_overlap(&state.buf, CAPTURE_BEGIN);
+                let flush_to = state.buf.len() - hold;
+                logger.write(&state.buf[..flush_to]);
+                state.buf.drain(..flush_to);
+                break;
+            }
+        } else if let Some(i) = find_subslice(&state.buf, CAPTURE_END) {
+            append_capped(&mut state.captured, &state.buf[..i], maxbytes);
+            state.buf.drain(..i + CAPTURE_END.len());
+            state.in_capture = false;
+            completed.push(std::mem::take(&mut state.captured));
+        } else {
+            let hold = prefix_overlap(&state.buf, CAPTURE_END);
+            let take_to = state.buf.len() - hold;
+            append_capped(&mut state.captured, &state.buf[..take_to], maxbytes);
+            state.buf.drain(..take_to);
+            break;
+        }
+    }
+    completed
+}
+
+fn append_capped(dst: &mut Vec<u8>, src: &[u8], maxbytes: usize) {
+    let room = maxbytes.saturating_sub(dst.len());
+    if room > 0 {
+        let take = room.min(src.len());
+        dst.extend_from_slice(&src[..take]);
+    }
+}
+
+/// Length of the longest suffix of `buf` that is a prefix of `token`.
+fn prefix_overlap(buf: &[u8], token: &[u8]) -> usize {
+    let max = token.len().saturating_sub(1).min(buf.len());
+    for k in (1..=max).rev() {
+        if buf[buf.len() - k..] == token[..k] {
+            return k;
+        }
+    }
+    0
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return None;
+    }
+    haystack.windows(needle.len()).position(|w| w == needle)
+}
+
 fn drain_fd(fd: i32, logger: &mut RotatingLogger) {
     let mut buf = [0u8; 8192];
     loop {
@@ -1047,6 +1198,26 @@ mod tests {
         assert_eq!(decode_status(7 << 8), (7, false));
         // killed by SIGKILL (9)
         assert_eq!(decode_status(9), (-9, true));
+    }
+
+    #[test]
+    fn capture_scanner_extracts_marked_spans() {
+        let mut state = CaptureState::default();
+        let mut logger = RotatingLogger::null();
+        // Split the markers across two feeds to exercise the holdback path.
+        let a = b"plain<!--XSUPERVISOR:BEGIN-->hello wo";
+        let b = b"rld<!--XSUPERVISOR:END-->tail";
+        let mut got = scan_capture(&mut state, a, 100, &mut logger);
+        got.extend(scan_capture(&mut state, b, 100, &mut logger));
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0], b"hello world");
+        assert!(!state.in_capture);
+    }
+
+    #[test]
+    fn prefix_overlap_detects_split_tokens() {
+        assert_eq!(prefix_overlap(b"abc<!--", b"<!--XSUPERVISOR:BEGIN-->"), 4);
+        assert_eq!(prefix_overlap(b"abcdef", b"<!--XSUPERVISOR:BEGIN-->"), 0);
     }
 
     #[test]

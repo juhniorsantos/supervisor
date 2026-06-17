@@ -72,6 +72,11 @@ pub struct ProgramConfig {
     pub stderr_logfile: LogTarget,
     pub stderr_logfile_maxbytes: u64,
     pub stderr_logfile_backups: u32,
+    /// When > 0, capture stdout/stderr written between
+    /// `<!--XSUPERVISOR:BEGIN-->`/`<!--XSUPERVISOR:END-->` markers and emit a
+    /// `PROCESS_COMMUNICATION_*` event (up to this many bytes).
+    pub stdout_capture_maxbytes: u64,
+    pub stderr_capture_maxbytes: u64,
     /// True for `[eventlistener:x]` sections: the process speaks the event
     /// notification protocol on its stdin/stdout.
     pub is_listener: bool,
@@ -718,6 +723,8 @@ fn parse_program(
     let stderr_logfile = parse_log_target(m.get("stderr_logfile").copied());
     let stderr_logfile_maxbytes = m.get("stderr_logfile_maxbytes").map(|v| parse_byte_size(v)).transpose()?.unwrap_or(50 * 1024 * 1024);
     let stderr_logfile_backups = m.get("stderr_logfile_backups").map(|v| v.parse()).transpose().map_err(|_| "invalid stderr_logfile_backups")?.unwrap_or(10);
+    let stdout_capture_maxbytes = m.get("stdout_capture_maxbytes").map(|v| parse_byte_size(v)).transpose()?.unwrap_or(0);
+    let stderr_capture_maxbytes = m.get("stderr_capture_maxbytes").map(|v| parse_byte_size(v)).transpose()?.unwrap_or(0);
 
     let mut environment = supervisord.environment.clone();
     if let Some(v) = m.get("environment") {
@@ -756,6 +763,8 @@ fn parse_program(
             stderr_logfile: stderr_logfile.clone(),
             stderr_logfile_maxbytes,
             stderr_logfile_backups,
+            stdout_capture_maxbytes,
+            stderr_capture_maxbytes,
             is_listener,
             events: events.clone(),
             buffer_size,
