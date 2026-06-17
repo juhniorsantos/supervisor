@@ -106,6 +106,19 @@ impl Default for SupervisordConfig {
     }
 }
 
+/// Optional HTTP Basic auth credentials for a control server.
+#[derive(Clone, Debug, Default)]
+pub struct HttpAuth {
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+impl HttpAuth {
+    pub fn is_set(&self) -> bool {
+        self.username.is_some()
+    }
+}
+
 /// The fully parsed configuration file.
 #[derive(Clone, Debug)]
 pub struct Config {
@@ -113,6 +126,12 @@ pub struct Config {
     pub programs: Vec<ProgramConfig>,
     /// Path to the unix control socket (`[unix_http_server] file=`).
     pub socket_path: Option<PathBuf>,
+    /// Basic-auth credentials for the unix socket, if configured.
+    pub unix_auth: HttpAuth,
+    /// `ip:port` from `[inet_http_server] port=`, if the section is present.
+    pub inet_addr: Option<String>,
+    /// Basic-auth credentials for the inet server, if configured.
+    pub inet_auth: HttpAuth,
 }
 
 fn default_tmpdir() -> PathBuf {
@@ -350,6 +369,9 @@ impl Config {
         let sections = parse_ini(text)?;
         let mut supervisord = SupervisordConfig::default();
         let mut socket_path = None;
+        let mut unix_auth = HttpAuth::default();
+        let mut inet_addr = None;
+        let mut inet_auth = HttpAuth::default();
         let mut programs = Vec::new();
 
         for sec in &sections {
@@ -360,6 +382,19 @@ impl Config {
                 if let Some(f) = m.get("file") {
                     socket_path = Some(PathBuf::from(*f));
                 }
+                unix_auth = HttpAuth {
+                    username: m.get("username").map(|s| s.to_string()),
+                    password: m.get("password").map(|s| s.to_string()),
+                };
+            } else if sec.name == "inet_http_server" {
+                let m = items_map(&sec.items);
+                if let Some(p) = m.get("port") {
+                    inet_addr = Some(normalize_inet_addr(p));
+                }
+                inet_auth = HttpAuth {
+                    username: m.get("username").map(|s| s.to_string()),
+                    password: m.get("password").map(|s| s.to_string()),
+                };
             } else if let Some(prog) = sec.name.strip_prefix("program:") {
                 let expanded = parse_program(prog.trim(), &sec.items, &supervisord)?;
                 programs.extend(expanded);
@@ -375,7 +410,24 @@ impl Config {
             supervisord,
             programs,
             socket_path,
+            unix_auth,
+            inet_addr,
+            inet_auth,
         })
+    }
+}
+
+/// Normalise an `[inet_http_server] port=` value into a `host:port` string
+/// suitable for `TcpListener::bind`. `*:9001` binds all interfaces; a bare
+/// `9001` binds localhost.
+fn normalize_inet_addr(port: &str) -> String {
+    let port = port.trim();
+    if let Some(rest) = port.strip_prefix("*:") {
+        format!("0.0.0.0:{rest}")
+    } else if port.contains(':') {
+        port.to_string()
+    } else {
+        format!("127.0.0.1:{port}")
     }
 }
 

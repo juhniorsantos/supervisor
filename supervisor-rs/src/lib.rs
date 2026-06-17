@@ -16,6 +16,10 @@
 pub mod config;
 pub mod control;
 pub mod daemon;
+pub mod http;
 pub mod logger;
 pub mod process;
+pub mod rpc;
 pub mod states;
+pub mod web;
+pub mod xmlrpc;

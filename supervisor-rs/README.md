@@ -56,8 +56,12 @@ The crate is split into focused modules (`src/`):
 | `config.rs`   | INI parser for `supervisord.conf` (a useful subset). |
 | `logger.rs`   | Size-based rotating log files. |
 | `process.rs`  | One supervised process and its full state machine. |
-| `daemon.rs`   | The event loop, control socket server and command dispatch. |
-| `control.rs`  | The line-based client/server control protocol. |
+| `daemon.rs`   | The event loop, HTTP control server and operations. |
+| `http.rs`     | A tiny HTTP/1.1 request/response core (+ Basic auth). |
+| `xmlrpc.rs`   | A dependency-free XML-RPC parser/serializer. |
+| `rpc.rs`      | The `supervisor.*` XML-RPC method set (API 3.0). |
+| `web.rs`      | The web management UI served at `GET /`. |
+| `control.rs`  | XML-RPC-over-HTTP client used by `supervisorctl`. |
 | `bin/supervisord.rs`   | Daemon entry point (arg parsing, daemonize, pidfile). |
 | `bin/supervisorctl.rs` | Client entry point (one-shot + interactive REPL). |
 
@@ -66,13 +70,38 @@ children with `waitpid(WNOHANG)`, drains their stdout/stderr pipes into the
 rotating loggers, advances every process's state machine, and services any
 pending control connections.
 
+### Control over HTTP / XML-RPC
+
+Just like the original Supervisor, the daemon speaks **XML-RPC over HTTP** at
+`POST /RPC2` and serves a **web UI** at `GET /`, on both the unix socket and
+the optional `[inet_http_server]` TCP port. The `supervisor.*` method set
+(API version `3.0`) is compatible enough that **the upstream Python
+`supervisorctl` can control this Rust daemon unchanged**:
+
+```sh
+# Point the original client at the Rust daemon's socket:
+python -m supervisor.supervisorctl -c supervisord.conf status
+```
+
+Implemented RPC methods: `getAPIVersion`/`getVersion`,
+`getSupervisorVersion`, `getIdentification`, `getState`, `getPID`,
+`getAllProcessInfo`, `getProcessInfo`, `startProcess`, `stopProcess`,
+`startProcessGroup`, `stopProcessGroup`, `startAllProcesses`,
+`stopAllProcesses`, `readProcessStdoutLog`/`readProcessStderrLog`,
+`tailProcessStdoutLog`/`tailProcessStderrLog`, `shutdown`, `restart`. HTTP
+Basic auth (`username=`/`password=`) is enforced when configured.
+
 ## Supported configuration
 
 `[supervisord]`: `logfile`, `logfile_maxbytes`, `logfile_backups`,
 `loglevel`, `pidfile`, `nodaemon`, `silent`, `childlogdir`, `directory`,
 `identifier`, `umask`, `environment`.
 
-`[unix_http_server]`: `file` (the control socket path).
+`[unix_http_server]`: `file` (the control socket path), `username`,
+`password`.
+
+`[inet_http_server]`: `port` (`ip:port`, or `*:port` for all interfaces),
+`username`, `password`.
 
 `[program:x]`: `command`, `process_name`, `numprocs`, `directory`,
 `autostart`, `autorestart` (`true`/`false`/`unexpected`), `startsecs`,
@@ -84,13 +113,10 @@ pending control connections.
 
 ```
 status [name|all]    start <name|all>    stop <name|all>
-restart <name|all>   pid [name]          version
+restart <name|all>   tail <name> [stderr]
+pid [name]           version             reload (restart supervisord)
 shutdown             help
 ```
-
-Unlike the original (which speaks XML-RPC over HTTP), this core uses a small
-line-based protocol over the same unix socket. The wire format is documented
-in `src/control.rs`, leaving room to add an XML-RPC compatibility layer later.
 
 ## Scope
 
@@ -105,19 +131,20 @@ Implemented (the MVP you asked for):
 - [x] Process-group signalling (children are placed in their own session)
 - [x] Captured stdout/stderr with size-based log rotation (`redirect_stderr` too)
 - [x] `setuid`/`umask`/`directory`/`environment` per program
-- [x] Unix control socket + `supervisorctl` (one-shot and interactive)
 - [x] Daemonization, pidfile, clean shutdown (socket/pidfile removal)
+- [x] **XML-RPC API over HTTP** (`POST /RPC2`) on unix + inet sockets
+- [x] **Web management UI** (`GET /`) with start/stop/restart actions
+- [x] `[inet_http_server]` TCP control + HTTP Basic auth
+- [x] Compatibility with the upstream Python `supervisorctl`
+- [x] `supervisorctl tail`, `reload` (daemon `restart` via re-exec)
 
-Not yet ported (intentionally out of MVP scope):
+Not yet ported (natural next phases):
 
-- [ ] XML-RPC API and HTTP server
-- [ ] Web management UI
 - [ ] Event listeners / the event notification protocol
-- [ ] `[group:x]` sections and `[inet_http_server]`
-- [ ] `supervisorctl tail`/`fg`, log capture mode, `reread`/`update`
+- [ ] `[group:x]` sections (each program is currently its own group)
+- [ ] `supervisorctl fg`, log capture mode, `reread`/`update`/`add`/`remove`
 - [ ] Syslog output, config `[include]` files
-
-These are natural next phases that can be layered on top of this core.
+- [ ] Additional RPC methods (`signalProcess`, `clearLog`, `sendProcessStdin`, …)
 
 ## Tests
 
@@ -126,10 +153,13 @@ cargo test
 ```
 
 Unit tests cover config parsing (byte sizes, comments, `process_name`
-expansion, environment), command-line splitting, and `waitpid` status
-decoding. The state machine has been exercised end-to-end against a live
-daemon (autostart, backoff→FATAL, stop/start/restart, autorestart, and clean
-shutdown with no leaked children).
+expansion, environment), command-line splitting, `waitpid` status decoding,
+XML-RPC parsing/serialisation, and HTTP request parsing + Basic auth
+decoding. The system has additionally been exercised end-to-end against a
+live daemon: autostart, backoff→FATAL, stop/start/restart, autorestart, clean
+shutdown with no leaked children, the web UI over the inet port, and — as a
+compatibility check — the **upstream Python `supervisorctl` driving the Rust
+daemon** (status/start/stop).
 
 ## Relationship to the original
 

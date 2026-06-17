@@ -16,7 +16,7 @@ use std::ffi::CString;
 use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::config::{AutoRestart, LogTarget, ProgramConfig};
 use crate::logger::RotatingLogger;
@@ -35,6 +35,13 @@ pub struct Process {
     backoff: u32,
     /// When the current attempt was spawned.
     laststart: Option<Instant>,
+    /// Wall-clock spawn / exit times, reported as epoch seconds by the API.
+    laststart_sys: Option<SystemTime>,
+    laststop_sys: Option<SystemTime>,
+    /// Resolved stdout/stderr log paths (empty string when disabled), as the
+    /// API surfaces them.
+    pub stdout_path: String,
+    pub stderr_path: String,
     /// Last observed exit code (negative for signal-terminated).
     pub exitstatus: Option<i32>,
     /// Human-readable reason the last start failed.
@@ -70,6 +77,12 @@ impl Process {
             config.stderr_logfile_maxbytes,
             config.stderr_logfile_backups,
         );
+        let stdout_path = resolved_log_path(&config.stdout_logfile, childlogdir, &config.name, "stdout");
+        let stderr_path = if config.redirect_stderr {
+            String::new()
+        } else {
+            resolved_log_path(&config.stderr_logfile, childlogdir, &config.name, "stderr")
+        };
         Process {
             config,
             state: ProcessState::Stopped,
@@ -77,6 +90,10 @@ impl Process {
             delay: None,
             backoff: 0,
             laststart: None,
+            laststart_sys: None,
+            laststop_sys: None,
+            stdout_path,
+            stderr_path,
             exitstatus: None,
             spawnerr: None,
             administratively_stopped: false,
@@ -192,6 +209,7 @@ impl Process {
                 // Drop would not reap on Unix anyway, but this is explicit.
                 std::mem::forget(child);
                 self.laststart = Some(now);
+                self.laststart_sys = Some(SystemTime::now());
                 self.delay = Some(now + Duration::from_secs(self.config.startsecs));
                 self.spawnerr = None;
                 self.stdout_read = Some(out_r);
@@ -228,6 +246,7 @@ impl Process {
         let (es, signaled) = decode_status(raw_status);
         let expected = !signaled && self.config.exitcodes.contains(&es);
         self.pid = 0;
+        self.laststop_sys = Some(SystemTime::now());
 
         match self.state {
             ProcessState::Starting => {
@@ -441,6 +460,83 @@ impl Process {
             ProcessState::Unknown => String::new(),
         }
     }
+
+    /// Produce an API snapshot of this process, matching the fields and the
+    /// `description` formatting of the original `getProcessInfo`.
+    pub fn info(&self, now_epoch: i64) -> ProcessInfo {
+        let start = self
+            .laststart_sys
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let stop = self
+            .laststop_sys
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs() as i64)
+            .unwrap_or(0);
+        let description = self.interpret_description(start, stop, now_epoch);
+        ProcessInfo {
+            name: self.config.name.clone(),
+            group: self.config.name.clone(), // each program is its own group
+            state: self.state as i64,
+            statename: self.state.description().to_string(),
+            pid: self.pid,
+            start,
+            stop,
+            now: now_epoch,
+            exitstatus: self.exitstatus.unwrap_or(0),
+            spawnerr: self.spawnerr.clone().unwrap_or_default(),
+            stdout_logfile: self.stdout_path.clone(),
+            stderr_logfile: self.stderr_path.clone(),
+            description,
+        }
+    }
+
+    /// Port of `rpcinterface._interpretProcessInfo`.
+    fn interpret_description(&self, start: i64, stop: i64, now: i64) -> String {
+        match self.state {
+            ProcessState::Running => {
+                let uptime = (now - start).max(0);
+                format!(
+                    "pid {}, uptime {}",
+                    self.pid,
+                    fmt_duration(Duration::from_secs(uptime as u64))
+                )
+            }
+            ProcessState::Fatal | ProcessState::Backoff => self
+                .spawnerr
+                .clone()
+                .filter(|s| !s.is_empty())
+                .unwrap_or_else(|| format!("unknown error (try \"tail {}\")", self.config.name)),
+            ProcessState::Stopped | ProcessState::Exited => {
+                if start > 0 {
+                    fmt_stop_time(stop)
+                } else {
+                    "Not started".to_string()
+                }
+            }
+            _ => String::new(),
+        }
+    }
+}
+
+/// An API-facing snapshot of a process's state (mirrors the struct returned
+/// by the original `supervisor.getProcessInfo`).
+#[derive(Clone, Debug)]
+pub struct ProcessInfo {
+    pub name: String,
+    pub group: String,
+    pub state: i64,
+    pub statename: String,
+    pub pid: i32,
+    pub start: i64,
+    pub stop: i64,
+    pub now: i64,
+    pub exitstatus: i32,
+    pub spawnerr: String,
+    pub stdout_logfile: String,
+    pub stderr_logfile: String,
+    pub description: String,
 }
 
 fn make_logger(
@@ -457,6 +553,45 @@ fn make_logger(
         LogTarget::Path(p) => p.clone(),
     };
     RotatingLogger::new(Some(path), maxbytes, backups).unwrap_or_else(|_| RotatingLogger::null())
+}
+
+/// The on-disk path a stream's log resolves to (empty when disabled),
+/// matching `make_logger`'s resolution but as a string for the API.
+fn resolved_log_path(
+    target: &LogTarget,
+    childlogdir: &std::path::Path,
+    name: &str,
+    stream: &str,
+) -> String {
+    match target {
+        LogTarget::None => String::new(),
+        LogTarget::Auto => childlogdir
+            .join(format!("{name}-{stream}.log"))
+            .to_string_lossy()
+            .into_owned(),
+        LogTarget::Path(p) => p.to_string_lossy().into_owned(),
+    }
+}
+
+/// Format an epoch as `%b %d %I:%M %p` (e.g. `Jun 17 09:05 PM`) in local
+/// time, matching the original's stopped/exited description.
+fn fmt_stop_time(epoch: i64) -> String {
+    const MONTHS: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let t = epoch as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&t, &mut tm) };
+    let mon = MONTHS.get(tm.tm_mon as usize).copied().unwrap_or("Jan");
+    let hour12 = match tm.tm_hour % 12 {
+        0 => 12,
+        h => h,
+    };
+    let ampm = if tm.tm_hour < 12 { "AM" } else { "PM" };
+    format!(
+        "{} {:02} {:02}:{:02} {}",
+        mon, tm.tm_mday, hour12, tm.tm_min, ampm
+    )
 }
 
 /// Decode a `waitpid` status into `(exit_code, was_signaled)`. For a
