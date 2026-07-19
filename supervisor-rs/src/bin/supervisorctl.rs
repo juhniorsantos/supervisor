@@ -121,29 +121,40 @@ fn cmd_status(socket: &Path, args: &[String]) {
         Ok(_) => Vec::new(),
         Err(e) => return fail_call(socket, e),
     };
-    let want: Option<&String> = args.first().filter(|a| a.as_str() != "all");
-    let mut shown = false;
-    for info in &infos {
-        let name = get_str(info, "name");
-        let namespec = make_namespec(&get_str(info, "group"), &name);
-        if let Some(w) = want {
-            if &name != w && &namespec != w {
-                continue;
+    if args.is_empty() || args.iter().any(|a| a == "all") {
+        for info in &infos {
+            print_status_line(info);
+        }
+        return;
+    }
+    for want in args {
+        let (group_want, proc_want) = split_namespec(want);
+        let mut found = false;
+        for info in &infos {
+            let name = get_str(info, "name");
+            let group = get_str(info, "group");
+            let namespec = make_namespec(&group, &name);
+            let matched = namespec == *want
+                || name == *want
+                || (proc_want.is_none() && group == group_want);
+            if matched {
+                found = true;
+                print_status_line(info);
             }
         }
-        shown = true;
-        println!(
-            "{:<28} {:<10} {}",
-            namespec,
-            get_str(info, "statename"),
-            get_str(info, "description")
-        );
-    }
-    if !shown {
-        if let Some(w) = want {
-            println!("{w}: ERROR (no such process)");
+        if !found {
+            println!("{want}: ERROR (no such process)");
         }
     }
+}
+
+fn print_status_line(info: &Value) {
+    println!(
+        "{:<28} {:<10} {}",
+        make_namespec(&get_str(info, "group"), &get_str(info, "name")),
+        get_str(info, "statename"),
+        get_str(info, "description")
+    );
 }
 
 fn cmd_start(socket: &Path, args: &[String]) {
@@ -566,6 +577,18 @@ fn make_namespec(group: &str, name: &str) -> String {
         name.to_string()
     } else {
         format!("{group}:{name}")
+    }
+}
+
+/// Split a namespec into `(group, process)` like the original
+/// `split_namespec`: `"grp:proc"` -> `("grp", Some("proc"))`, and a
+/// whole-group spec — `"grp:"` or `"grp:*"` — -> `("grp", None)`. A bare
+/// name means "group and process share the name": `("n", Some("n"))`.
+fn split_namespec(spec: &str) -> (String, Option<String>) {
+    match spec.split_once(':') {
+        Some((group, proc)) if proc.is_empty() || proc == "*" => (group.to_string(), None),
+        Some((group, proc)) => (group.to_string(), Some(proc.to_string())),
+        None => (spec.to_string(), Some(spec.to_string())),
     }
 }
 
