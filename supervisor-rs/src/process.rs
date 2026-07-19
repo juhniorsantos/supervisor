@@ -1165,7 +1165,7 @@ fn drain_fd(fd: i32, logger: &mut RotatingLogger) {
 fn make_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     use std::os::fd::FromRawFd;
     let mut fds = [0i32; 2];
-    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    let rc = crate::util::pipe2(&mut fds, libc::O_CLOEXEC);
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }
@@ -1188,7 +1188,7 @@ fn make_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
 fn make_stdin_pipe() -> std::io::Result<(OwnedFd, OwnedFd)> {
     use std::os::fd::FromRawFd;
     let mut fds = [0i32; 2];
-    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+    let rc = crate::util::pipe2(&mut fds, libc::O_CLOEXEC);
     if rc != 0 {
         return Err(std::io::Error::last_os_error());
     }

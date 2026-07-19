@@ -24,6 +24,50 @@ pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
+/// Portable `pipe2(2)`: create a pipe with the `O_CLOEXEC` / `O_NONBLOCK`
+/// bits from `flags` applied to both ends. Returns 0 on success, -1 on
+/// failure (with `errno` set), like the syscall.
+///
+/// On Linux this is the real `pipe2`, so the flags are applied atomically.
+/// Other platforms (e.g. macOS) have no `pipe2`, so we fall back to
+/// `pipe(2)` + `fcntl(2)`; supervisord is single-threaded at pipe-creation
+/// time, so the window between the two calls is harmless there.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+pub fn pipe2(fds: &mut [libc::c_int; 2], flags: libc::c_int) -> libc::c_int {
+    unsafe { libc::pipe2(fds.as_mut_ptr(), flags) }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+pub fn pipe2(fds: &mut [libc::c_int; 2], flags: libc::c_int) -> libc::c_int {
+    unsafe {
+        if libc::pipe(fds.as_mut_ptr()) != 0 {
+            return -1;
+        }
+        for &fd in fds.iter() {
+            if flags & libc::O_CLOEXEC != 0 {
+                let fd_flags = libc::fcntl(fd, libc::F_GETFD);
+                if fd_flags < 0
+                    || libc::fcntl(fd, libc::F_SETFD, fd_flags | libc::FD_CLOEXEC) != 0
+                {
+                    libc::close(fds[0]);
+                    libc::close(fds[1]);
+                    return -1;
+                }
+            }
+            if flags & libc::O_NONBLOCK != 0 {
+                let fl_flags = libc::fcntl(fd, libc::F_GETFL);
+                if fl_flags < 0 || libc::fcntl(fd, libc::F_SETFL, fl_flags | libc::O_NONBLOCK) != 0
+                {
+                    libc::close(fds[0]);
+                    libc::close(fds[1]);
+                    return -1;
+                }
+            }
+        }
+        0
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

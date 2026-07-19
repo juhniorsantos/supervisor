@@ -113,7 +113,7 @@ fn poll_wait(
 /// SIGCHLD. Returns `(read_fd, write_fd)`.
 fn make_self_pipe() -> (i32, i32) {
     let mut fds = [0i32; 2];
-    let rc = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK) };
+    let rc = crate::util::pipe2(&mut fds, libc::O_CLOEXEC | libc::O_NONBLOCK);
     if rc != 0 {
         return (-1, -1);
     }
