@@ -295,6 +295,13 @@ impl Supervisor {
         listener
             .set_nonblocking(true)
             .map_err(|e| format!("cannot set socket non-blocking: {e}"))?;
+        if let Some(m) = config.socket_chmod {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(m));
+        }
+        if let Some(o) = &config.socket_chown {
+            chown_path(&socket_path.to_string_lossy(), o);
+        }
 
         let inet_listener = match &config.inet_addr {
             Some(addr) => {

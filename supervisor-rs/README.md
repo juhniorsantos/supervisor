@@ -26,6 +26,10 @@ This produces two binaries in `target/release/`:
 * `supervisord`   — the supervisor daemon
 * `supervisorctl` — the control client
 
+To install as a system service (systemd on Linux, launchd on macOS), see
+[`packaging/README.md`](packaging/README.md) — or just run
+`sudo ./packaging/install.sh`.
+
 ## Quick start
 
 ```sh

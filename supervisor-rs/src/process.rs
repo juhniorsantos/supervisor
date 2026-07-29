@@ -585,10 +585,15 @@ impl Process {
             ProcessState::Backoff => {
                 if self.backoff > self.config.startretries {
                     self.delay = None;
-                    self.spawnerr = Some(format!(
-                        "Exited too quickly; gave up after {} retries",
-                        self.config.startretries
-                    ));
+                    self.spawnerr = Some(match &self.spawnerr {
+                        Some(reason) => {
+                            format!("{reason} (gave up after {} retries)", self.config.startretries)
+                        }
+                        None => format!(
+                            "Exited too quickly; gave up after {} retries",
+                            self.config.startretries
+                        ),
+                    });
                     self.change_state(ProcessState::Fatal);
                 } else if !shutting_down {
                     if let Some(d) = self.delay {

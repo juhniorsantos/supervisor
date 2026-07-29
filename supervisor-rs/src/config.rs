@@ -160,6 +160,10 @@ pub struct Config {
     pub programs: Vec<ProgramConfig>,
     /// Path to the unix control socket (`[unix_http_server] file=`).
     pub socket_path: Option<PathBuf>,
+    /// `chown` (`user` or `user:group`) to apply to the unix control socket.
+    pub socket_chown: Option<String>,
+    /// `chmod` (octal) to apply to the unix control socket.
+    pub socket_chmod: Option<u32>,
     /// Basic-auth credentials for the unix socket, if configured.
     pub unix_auth: HttpAuth,
     /// `ip:port` from `[inet_http_server] port=`, if the section is present.
@@ -436,6 +440,8 @@ impl Config {
     fn build(sections: Vec<Section>) -> Result<Config, String> {
         let mut supervisord = SupervisordConfig::default();
         let mut socket_path = None;
+        let mut socket_chown = None;
+        let mut socket_chmod = None;
         let mut unix_auth = HttpAuth::default();
         let mut inet_addr = None;
         let mut inet_auth = HttpAuth::default();
@@ -449,6 +455,14 @@ impl Config {
                 if let Some(f) = m.get("file") {
                     socket_path = Some(PathBuf::from(*f));
                 }
+                socket_chown = m.get("chown").map(|s| s.to_string());
+                socket_chmod = match m.get("chmod") {
+                    None => None,
+                    Some(v) => Some(
+                        u32::from_str_radix(v.trim_start_matches("0o").trim(), 8)
+                            .map_err(|_| "invalid chmod")?,
+                    ),
+                };
                 unix_auth = HttpAuth {
                     username: m.get("username").map(|s| s.to_string()),
                     password: m.get("password").map(|s| s.to_string()),
@@ -522,6 +536,8 @@ impl Config {
             supervisord,
             programs,
             socket_path,
+            socket_chown,
+            socket_chmod,
             unix_auth,
             inet_addr,
             inet_auth,
@@ -897,6 +913,19 @@ process_name=%(program_name)s_%(process_num)02d
         assert_eq!(cfg.programs[0].name, "web_00");
         assert_eq!(cfg.programs[1].name, "web_01");
         assert_eq!(cfg.programs[0].autorestart, AutoRestart::Unexpected);
+    }
+
+    #[test]
+    fn parses_unix_http_server_chown_and_chmod() {
+        let text = "\
+[unix_http_server]
+file=/tmp/sup.sock
+chmod=0770
+chown=root:junior
+";
+        let cfg = Config::parse(text).unwrap();
+        assert_eq!(cfg.socket_chmod, Some(0o770));
+        assert_eq!(cfg.socket_chown.as_deref(), Some("root:junior"));
     }
 
     #[test]
