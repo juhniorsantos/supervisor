@@ -1,0 +1,323 @@
+//! The `supervisor.*` XML-RPC method set, dispatched against a live
+//! [`Supervisor`]. Method names, parameters, return shapes and fault codes
+//! follow the original `supervisor/rpcinterface.py` (API version 3.0) so the
+//! upstream `supervisorctl` can talk to this daemon unchanged.
+
+use std::time::Instant;
+
+use crate::daemon::Supervisor;
+use crate::process::ProcessInfo;
+use crate::xmlrpc::Value;
+
+/// The XML-RPC API version this daemon implements.
+pub const API_VERSION: &str = "3.0";
+
+/// Fault codes, matching `supervisor/xmlrpc.py` `Faults`.
+pub mod faults {
+    pub const UNKNOWN_METHOD: i32 = 1;
+    pub const INCORRECT_PARAMETERS: i32 = 2;
+    pub const BAD_NAME: i32 = 10;
+    pub const BAD_SIGNAL: i32 = 11;
+    pub const NO_FILE: i32 = 20;
+    pub const FAILED: i32 = 30;
+    pub const SPAWN_ERROR: i32 = 50;
+    pub const ALREADY_STARTED: i32 = 60;
+    pub const NOT_RUNNING: i32 = 70;
+    pub const SUCCESS: i32 = 80;
+    pub const ALREADY_ADDED: i32 = 90;
+    pub const STILL_RUNNING: i32 = 91;
+    pub const CANT_REREAD: i32 = 92;
+}
+
+/// Dispatch a single XML-RPC call. Returns the response value, or a
+/// `(fault_code, fault_string)` pair.
+pub fn dispatch(
+    sup: &mut Supervisor,
+    method: &str,
+    params: &[Value],
+    now: Instant,
+) -> Result<Value, (i32, String)> {
+    // Methods are namespaced as `supervisor.<name>`; accept the bare name too.
+    let name = method.strip_prefix("supervisor.").unwrap_or(method);
+
+    match name {
+        "getAPIVersion" | "getVersion" => Ok(Value::Str(API_VERSION.to_string())),
+        "getSupervisorVersion" => Ok(Value::Str(env!("CARGO_PKG_VERSION").to_string())),
+        "getIdentification" => Ok(Value::Str(sup.identifier().to_string())),
+        "getState" => {
+            let state = sup.supervisor_state();
+            Ok(Value::Struct(vec![
+                ("statecode".into(), Value::Int(state as i64)),
+                ("statename".into(), Value::Str(state.description().to_string())),
+            ]))
+        }
+        "getPID" => Ok(Value::Int(sup.supervisor_pid() as i64)),
+
+        "getAllProcessInfo" => {
+            let infos = sup.all_process_info();
+            Ok(Value::Array(infos.iter().map(info_to_value).collect()))
+        }
+        "getProcessInfo" => {
+            let name = str_param(params, 0)?;
+            match sup.process_info(&name) {
+                Some(info) => Ok(info_to_value(&info)),
+                None => Err((faults::BAD_NAME, name)),
+            }
+        }
+
+        "startProcess" => {
+            let name = str_param(params, 0)?;
+            // `group:*` targets the whole group (returns an array of results).
+            if let Some(group) = group_spec(&name) {
+                if !sup.has_group(&group) {
+                    return Err((faults::BAD_NAME, name));
+                }
+                return Ok(results_array(&sup.op_start_group(&group, now)));
+            }
+            sup.op_start(&name, now)?;
+            Ok(Value::Bool(true))
+        }
+        "stopProcess" => {
+            let name = str_param(params, 0)?;
+            if let Some(group) = group_spec(&name) {
+                if !sup.has_group(&group) {
+                    return Err((faults::BAD_NAME, name));
+                }
+                return Ok(results_array(&sup.op_stop_group(&group, now)));
+            }
+            sup.op_stop(&name, now)?;
+            Ok(Value::Bool(true))
+        }
+        "startProcessGroup" => {
+            let name = str_param(params, 0)?;
+            let results = sup.op_start_group(&name, now);
+            Ok(Value::Array(
+                results.iter().map(|(n, g, c, d)| result_struct(n, g, *c, d)).collect(),
+            ))
+        }
+        "stopProcessGroup" => {
+            let name = str_param(params, 0)?;
+            let results = sup.op_stop_group(&name, now);
+            Ok(Value::Array(
+                results.iter().map(|(n, g, c, d)| result_struct(n, g, *c, d)).collect(),
+            ))
+        }
+        "startAllProcesses" => {
+            let results = sup.op_start_all(now);
+            Ok(Value::Array(
+                results
+                    .iter()
+                    .map(|(n, g, c, d)| result_struct(n, g, *c, d))
+                    .collect(),
+            ))
+        }
+        "stopAllProcesses" => {
+            let results = sup.op_stop_all(now);
+            Ok(Value::Array(
+                results
+                    .iter()
+                    .map(|(n, g, c, d)| result_struct(n, g, *c, d))
+                    .collect(),
+            ))
+        }
+
+        "readProcessStdoutLog" | "readProcessLog" => read_log(sup, params, "stdout"),
+        "readProcessStderrLog" => read_log(sup, params, "stderr"),
+        "tailProcessStdoutLog" => tail_log(sup, params, "stdout"),
+        "tailProcessStderrLog" => tail_log(sup, params, "stderr"),
+        "readLog" | "readMainLog" => {
+            let offset = int_param(params, 0).unwrap_or(0);
+            let length = int_param(params, 1).unwrap_or(0);
+            Ok(Value::Str(sup.read_main_log(offset, length)?))
+        }
+        "clearLog" => {
+            sup.clear_main_log()?;
+            Ok(Value::Bool(true))
+        }
+
+        "signalProcess" => {
+            let name = str_param(params, 0)?;
+            let sig = signal_param(params, 1)?;
+            if let Some(group) = group_spec(&name) {
+                if !sup.has_group(&group) {
+                    return Err((faults::BAD_NAME, name));
+                }
+                return Ok(results_array(&sup.op_signal_group(&group, sig)));
+            }
+            sup.op_signal(&name, sig)?;
+            Ok(Value::Bool(true))
+        }
+        "signalProcessGroup" => {
+            let name = str_param(params, 0)?;
+            let sig = signal_param(params, 1)?;
+            let results = sup.op_signal_group(&name, sig);
+            Ok(results_array(&results))
+        }
+        "signalAllProcesses" => {
+            let sig = signal_param(params, 0)?;
+            let results = sup.op_signal_all(sig);
+            Ok(results_array(&results))
+        }
+
+        "clearProcessLogs" => {
+            let name = str_param(params, 0)?;
+            sup.op_clear_logs(&name)?;
+            Ok(Value::Bool(true))
+        }
+        "clearAllProcessLogs" => {
+            let results = sup.op_clear_all_logs();
+            Ok(results_array(&results))
+        }
+
+        "sendProcessStdin" => {
+            let name = str_param(params, 0)?;
+            let chars = str_param(params, 1)?;
+            sup.op_send_stdin(&name, &chars)?;
+            Ok(Value::Bool(true))
+        }
+        "sendRemoteCommEvent" => {
+            let kind = str_param(params, 0)?;
+            let data = str_param(params, 1)?;
+            sup.op_send_remote_comm_event(&kind, &data);
+            Ok(Value::Bool(true))
+        }
+
+        "reloadConfig" => {
+            let (added, changed, removed) = sup.reload_config()?;
+            let to_arr = |v: Vec<String>| Value::Array(v.into_iter().map(Value::Str).collect());
+            // Shape: [[added, changed, removed]]
+            Ok(Value::Array(vec![Value::Array(vec![
+                to_arr(added),
+                to_arr(changed),
+                to_arr(removed),
+            ])]))
+        }
+        "addProcessGroup" => {
+            let name = str_param(params, 0)?;
+            sup.add_process_group(&name, now)?;
+            Ok(Value::Bool(true))
+        }
+        "removeProcessGroup" => {
+            let name = str_param(params, 0)?;
+            sup.remove_process_group(&name)?;
+            Ok(Value::Bool(true))
+        }
+
+        "shutdown" => {
+            sup.request_shutdown();
+            Ok(Value::Bool(true))
+        }
+        "restart" => {
+            sup.request_restart();
+            Ok(Value::Bool(true))
+        }
+
+        other => Err((faults::UNKNOWN_METHOD, format!("supervisor.{other}"))),
+    }
+}
+
+fn read_log(
+    sup: &Supervisor,
+    params: &[Value],
+    channel: &str,
+) -> Result<Value, (i32, String)> {
+    let name = str_param(params, 0)?;
+    let offset = int_param(params, 1).unwrap_or(0);
+    let length = int_param(params, 2).unwrap_or(0);
+    let text = sup.read_log(&name, channel, offset, length)?;
+    Ok(Value::Str(text))
+}
+
+/// `tailProcess*Log` returns `[bytes, new_offset, overflow]` with the
+/// original's offset/overflow semantics.
+fn tail_log(
+    sup: &Supervisor,
+    params: &[Value],
+    channel: &str,
+) -> Result<Value, (i32, String)> {
+    let name = str_param(params, 0)?;
+    let offset = int_param(params, 1).unwrap_or(0);
+    let length = int_param(params, 2).unwrap_or(0);
+    let (text, new_offset, overflow) = sup.tail_process_log(&name, channel, offset, length)?;
+    Ok(Value::Array(vec![
+        Value::Str(text),
+        Value::Int(new_offset),
+        Value::Bool(overflow),
+    ]))
+}
+
+/// If `name` is a whole-group spec (`group:*` or `group:`), return the group
+/// name; otherwise `None` (it targets a single process).
+fn group_spec(name: &str) -> Option<String> {
+    match name.split_once(':') {
+        Some((g, p)) if p.is_empty() || p == "*" => Some(g.to_string()),
+        _ => None,
+    }
+}
+
+fn info_to_value(info: &ProcessInfo) -> Value {
+    Value::Struct(vec![
+        ("name".into(), Value::Str(info.name.clone())),
+        ("group".into(), Value::Str(info.group.clone())),
+        ("start".into(), Value::Int(info.start)),
+        ("stop".into(), Value::Int(info.stop)),
+        ("now".into(), Value::Int(info.now)),
+        ("state".into(), Value::Int(info.state)),
+        ("statename".into(), Value::Str(info.statename.clone())),
+        ("spawnerr".into(), Value::Str(info.spawnerr.clone())),
+        ("exitstatus".into(), Value::Int(info.exitstatus as i64)),
+        ("logfile".into(), Value::Str(info.stdout_logfile.clone())),
+        ("stdout_logfile".into(), Value::Str(info.stdout_logfile.clone())),
+        ("stderr_logfile".into(), Value::Str(info.stderr_logfile.clone())),
+        ("pid".into(), Value::Int(info.pid as i64)),
+        ("description".into(), Value::Str(info.description.clone())),
+    ])
+}
+
+/// Build an XML-RPC array from `(name, group, status, description)` tuples.
+fn results_array(results: &[(String, String, i32, String)]) -> Value {
+    Value::Array(
+        results
+            .iter()
+            .map(|(n, g, c, d)| result_struct(n, g, *c, d))
+            .collect(),
+    )
+}
+
+/// Parse a signal parameter, which may be a name (`HUP`, `SIGTERM`) or a
+/// number (`1`, `15`).
+fn signal_param(params: &[Value], i: usize) -> Result<i32, (i32, String)> {
+    let raw = match params.get(i) {
+        Some(Value::Int(n)) => return Ok(*n as i32),
+        Some(Value::Str(s)) => s.clone(),
+        _ => return Err((faults::INCORRECT_PARAMETERS, format!("expected signal param {i}"))),
+    };
+    if let Ok(n) = raw.trim().parse::<i32>() {
+        return Ok(n);
+    }
+    crate::config::parse_signal(&raw).map_err(|_| (faults::BAD_SIGNAL, raw))
+}
+
+fn result_struct(name: &str, group: &str, status: i32, description: &str) -> Value {
+    Value::Struct(vec![
+        ("name".into(), Value::Str(name.to_string())),
+        ("group".into(), Value::Str(group.to_string())),
+        ("status".into(), Value::Int(status as i64)),
+        ("description".into(), Value::Str(description.to_string())),
+    ])
+}
+
+fn str_param(params: &[Value], i: usize) -> Result<String, (i32, String)> {
+    params
+        .get(i)
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or((faults::INCORRECT_PARAMETERS, format!("expected string param {i}")))
+}
+
+fn int_param(params: &[Value], i: usize) -> Option<i64> {
+    match params.get(i) {
+        Some(Value::Int(n)) => Some(*n),
+        _ => None,
+    }
+}

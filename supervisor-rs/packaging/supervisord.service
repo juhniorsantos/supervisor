@@ -1,0 +1,30 @@
+[Unit]
+Description=Supervisor process control system (Rust)
+Documentation=https://github.com/juhniorsantos/supervisor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Run in the foreground (-n) so systemd supervises the process directly and
+# can restart it if it ever dies. The -n flag overrides nodaemon in the file.
+ExecStart=/usr/local/bin/supervisord -n -c /etc/supervisor/supervisord.conf
+
+# "reload" tells supervisord to re-read its config and restart (it re-execs
+# itself, keeping the same PID). NOTE: this Rust build does not act on SIGHUP,
+# so do not use `kill -HUP` here.
+ExecReload=/usr/local/bin/supervisorctl -c /etc/supervisor/supervisord.conf reload
+
+# On stop, send SIGTERM to supervisord only and let it shut its children down
+# gracefully (honouring each program's stopsignal/stopwaitsecs); systemd
+# SIGKILLs anything still alive after TimeoutStopSec.
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Keep it running.
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
